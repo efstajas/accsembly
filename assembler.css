@@ -1,0 +1,2504 @@
+/* ==========================================================================
+   accsembly — an x86-16 assembler implemented entirely in CSS
+   ==========================================================================
+
+   This stylesheet IS the assembler. The CLI only splits source text into
+   tokens (DOM attributes) and reads the results back out of the layout.
+
+   How the machine works:
+
+   * #strip is the location counter. Every source line is an inline-block
+     whose width in pixels equals its encoded size in bytes. An `org 256`
+     directive is literally a 256px spacer. Therefore every line's address
+     is its x-coordinate, and a label's value is the position where its
+     zero-width marker lands. Layout is the accumulator.
+
+   * #bytes is the output bus. Every emitted byte is an element whose
+     width is (1000 + value) pixels. Playwright reads machine code off
+     the page with getBoundingClientRect().
+
+   * Two-pass assembly: after pass 1 the CLI copies each line's measured
+     address into an `at` attribute and each referenced label's address
+     into a `to` attribute (a fixup table, i.e. plumbing — no math).
+     The cascade then re-encodes jumps and immediates reactively.
+
+   * #list is a human-readable listing: addresses and machine code are
+     rendered as hexadecimal by CSS counters via @counter-style.
+
+   Attribute vocabulary (set by the lexer):
+     k   line kind: op | db | lbl | org | blank
+     op  mnemonic          a,b  operands           n  numeric value (org/db)
+     c   character (db strings)
+     at  own address (injected, pass 2)            to  target address (injected)
+   ========================================================================== */
+
+@property --n {
+  syntax: "<integer>";
+  inherits: true;
+  initial-value: 0;
+}
+
+@property --npfx {
+  syntax: "<integer>";
+  inherits: true;
+  initial-value: 0;
+}
+
+body { margin: 0; }
+
+/* --------------------------------------------------------------------------
+   The machine fabric (invisible, but very much laid out)
+   -------------------------------------------------------------------------- */
+
+#machine { position: absolute; top: 0; left: 0; visibility: hidden; }
+
+#strip,
+#bytes { position: absolute; left: 0; font-size: 0; white-space: nowrap; }
+#strip { top: 0; }
+#bytes { top: 100px; }
+
+/* location counter: one box per line, width = encoded size in px ---------- */
+/* (--n is the core encoding, --npfx counts prefix bytes: seg override, lock) */
+#strip .ln { display: inline-block; height: 1px; width: calc((var(--n, 0) + var(--npfx, 0)) * 1px); }
+#strip .ln[k="org"] { width: calc(max(0px, attr(n type(<number>), 0) * 1px)); }
+#strip .ln[k="db"] { width: auto; }               /* size = sum of its cells */
+#strip .ln[k="db"] > d { display: inline-block; width: 1px; height: 1px; }
+
+/* output bus: one row per line, one box per byte, width = 1000px + value -- */
+#bytes .ln { display: block; height: 1px; }
+#bytes .ln > u { display: inline-block; height: 1px;
+                 width: calc(max(0px, (1000 + var(--bv, -9999)) * 1px)); }
+#bytes .ln > u:nth-of-type(1) { --bv: var(--b1, -9999); }
+#bytes .ln > u:nth-of-type(2) { --bv: var(--b2, -9999); }
+#bytes .ln > u:nth-of-type(3) { --bv: var(--b3, -9999); }
+#bytes .ln > u:nth-of-type(4) { --bv: var(--b4, -9999); }
+#bytes .ln > u:nth-of-type(5) { --bv: var(--b5, -9999); }
+#bytes .ln > u:nth-of-type(6) { --bv: var(--b6, -9999); }
+/* prefix slots: laid out before the core bytes, same 1000+value bus */
+#bytes .ln > v { display: inline-block; height: 1px;
+                 width: calc(max(0px, (1000 + var(--bv, -9999)) * 1px)); }
+#bytes .ln > v:nth-of-type(1) { --bv: var(--p1, -9999); }
+#bytes .ln > v:nth-of-type(2) { --bv: var(--p2, -9999); }
+#bytes .ln > d { display: inline-block; height: 1px;
+                 width: calc(max(0px, (1000 + var(--v, -9999)) * 1px)); }
+
+/* --------------------------------------------------------------------------
+   Operand decoding
+   -------------------------------------------------------------------------- */
+
+/* immediates: prefer an injected label address (`to`), else parse the
+   operand text as a number; typed attr() is the instruction decoder */
+.ln {
+  /* fixups arrive on role-tagged wires: toa/tob for operand symbols, tod
+     for a symbol inside a memory operand, plain to for dw cells — so a
+     line can mix [msg+5] with a literal immediate without crosstalk */
+  --imm:  attr(tob type(<number>), attr(b type(<number>), var(--litb, 0))); /* 2nd operand */
+  --imma: attr(toa type(<number>), attr(a type(<number>), var(--lita, 0))); /* 1st operand */
+  /* hex literals ride role-tagged wires (ha1-4, hb1-4, hd1-4); the single
+     char literal (--v via the ASCII table) may serve either operand slot */
+  --lita: var(--hva, var(--v, 0));
+  --litb: var(--hvb, var(--v, 0));
+  /* signed view of --imm, and "fits in a signed byte" as a clamp() step
+     function: CSS has no comparisons, but it does have arithmetic */
+  --simm:  calc(mod(var(--imm), 65536) - 65536 * clamp(0, mod(var(--imm), 65536) - 32767, 1));
+  --ifits: clamp(0, 128 - max(var(--simm), -1 - var(--simm)), 1);
+  --at:   attr(at type(<number>), 0);                         /* own address */
+  /* memory displacement: resolved symbol plus literal offset; only one of
+     mad/mbd can exist, so summing both is just "whichever" */
+  --mdisp: calc(attr(tod type(<number>), 0)
+              + attr(mad type(<number>), 0)
+              + attr(mbd type(<number>), 0)
+              + var(--hvd, 0));
+  /* displacement size (0, 1 or 2 bytes), solved arithmetically:
+     nonzero? fits in a byte? does [bp] force a byte anyway? */
+  --mds:   calc(mod(var(--mdisp), 65536) - 65536 * clamp(0, mod(var(--mdisp), 65536) - 32767, 1));
+  --mnz:   clamp(0, max(var(--mds), 0 - var(--mds)), 1);
+  --mfits: clamp(0, 128 - max(var(--mds), -1 - var(--mds)), 1);
+  --dsz:   max(calc(var(--mnz) * (2 - var(--mfits))), var(--bpforce, 0));
+  --dmod:  calc(64 * var(--dsz));       /* mod bits: 00, 01, 10 */
+  --z3:    clamp(0, 1 - var(--dsz), 1); /* 1 = no disp byte at all */
+  --z4:    clamp(0, 2 - var(--dsz), 1); /* 1 = no high disp byte */
+  /* the line's resolved symbol, for dw cells (no fallback: an unresolved
+     dw label must fail loudly, not encode zero) */
+  --lto: attr(to type(<number>));
+}
+
+/* register file, 16-bit (--rd = destination, --rs = source) */
+.ln[a="ax" i] { --rd: 0; }  .ln[b="ax" i] { --rs: 0; }
+.ln[a="cx" i] { --rd: 1; }  .ln[b="cx" i] { --rs: 1; }
+.ln[a="dx" i] { --rd: 2; }  .ln[b="dx" i] { --rs: 2; }
+.ln[a="bx" i] { --rd: 3; }  .ln[b="bx" i] { --rs: 3; }
+.ln[a="sp" i] { --rd: 4; }  .ln[b="sp" i] { --rs: 4; }
+.ln[a="bp" i] { --rd: 5; }  .ln[b="bp" i] { --rs: 5; }
+.ln[a="si" i] { --rd: 6; }  .ln[b="si" i] { --rs: 6; }
+.ln[a="di" i] { --rd: 7; }  .ln[b="di" i] { --rs: 7; }
+
+/* register file, 8-bit */
+.ln[a="al" i] { --rd8: 0; }  .ln[b="al" i] { --rs8: 0; }
+.ln[a="cl" i] { --rd8: 1; }  .ln[b="cl" i] { --rs8: 1; }
+.ln[a="dl" i] { --rd8: 2; }  .ln[b="dl" i] { --rs8: 2; }
+.ln[a="bl" i] { --rd8: 3; }  .ln[b="bl" i] { --rs8: 3; }
+.ln[a="ah" i] { --rd8: 4; }  .ln[b="ah" i] { --rs8: 4; }
+.ln[a="ch" i] { --rd8: 5; }  .ln[b="ch" i] { --rs8: 5; }
+.ln[a="dh" i] { --rd8: 6; }  .ln[b="dh" i] { --rs8: 6; }
+.ln[a="bh" i] { --rd8: 7; }  .ln[b="bh" i] { --rs8: 7; }
+
+/* --------------------------------------------------------------------------
+   Memory operands: [bx+si+disp] and friends
+   The lexer splits the bracketed terms into ma1/ma2/mad (first operand) or
+   mb1/mb2/mbd (second operand). The rules below are Intel SDM Table 2-1,
+   transcribed into attribute selectors. Encoding policy: we always emit a
+   16-bit displacement (mod=10 with a base register, mod=00 rm=110 for a
+   direct address) — generously padded, never wrong. This also makes [bp]
+   work for free, since mod=00 rm=110 is taken by the direct form.
+   -------------------------------------------------------------------------- */
+
+/* rm field: base/index combinations (canonical order: base, index, disp) */
+.ln[mb1="bx" i][mb2="si" i], .ln[ma1="bx" i][ma2="si" i] { --rm: 0; }
+.ln[mb1="bx" i][mb2="di" i], .ln[ma1="bx" i][ma2="di" i] { --rm: 1; }
+.ln[mb1="bp" i][mb2="si" i], .ln[ma1="bp" i][ma2="si" i] { --rm: 2; }
+.ln[mb1="bp" i][mb2="di" i], .ln[ma1="bp" i][ma2="di" i] { --rm: 3; }
+.ln[mb1="si" i]:not([mb2]), .ln[ma1="si" i]:not([ma2]) { --rm: 4; }
+.ln[mb1="di" i]:not([mb2]), .ln[ma1="di" i]:not([ma2]) { --rm: 5; }
+.ln[mb1="bp" i]:not([mb2]), .ln[ma1="bp" i]:not([ma2]) { --rm: 6; --bpforce: 1; }
+.ln[mb1="bx" i]:not([mb2]), .ln[ma1="bx" i]:not([ma2]) { --rm: 7; }
+
+/* direct address: [label], [label+n], [1234] — mod=00, rm=110.
+   Excludes every register name: [ax] is not an addressing mode the 8086
+   can express, so it must fall through to "no encoding", not become a
+   symbol named ax. */
+.ln[mb1]:not(:is([mb1="ax" i],[mb1="cx" i],[mb1="dx" i],[mb1="bx" i],[mb1="sp" i],[mb1="bp" i],
+                 [mb1="si" i],[mb1="di" i],[mb1="al" i],[mb1="cl" i],[mb1="dl" i],[mb1="bl" i],
+                 [mb1="ah" i],[mb1="ch" i],[mb1="dh" i],[mb1="bh" i])):not([mb2]),
+.ln[mbd]:not([mb1]),
+.ln[ma1]:not(:is([ma1="ax" i],[ma1="cx" i],[ma1="dx" i],[ma1="bx" i],[ma1="sp" i],[ma1="bp" i],
+                 [ma1="si" i],[ma1="di" i],[ma1="al" i],[ma1="cl" i],[ma1="dl" i],[ma1="bl" i],
+                 [ma1="ah" i],[ma1="ch" i],[ma1="dh" i],[ma1="bh" i])):not([ma2]),
+.ln[mad]:not([ma1]) { --rm: 6; --dsz: 2; --dmod: 0; }
+
+/* --------------------------------------------------------------------------
+   THE OPCODE TABLE
+   Every rule below is an entry in the x86-16 encoding table. A line that
+   matches no rule gets no size and no bytes, which the CLI reports as
+   "no encoding" — i.e. selector specificity is our instruction validator.
+
+   Selector legend:
+     R16A/R16B  first/second operand is a 16-bit register
+     R8A/R8B    first/second operand is an 8-bit register
+   -------------------------------------------------------------------------- */
+
+/* ---- mov r16, r16 : 89 /r ------------------------------------------------ */
+.ln[op="mov" i]:is([a="ax" i],[a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],[a="si" i],
+                   [a="di" i]):is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],
+                   [b="si" i],[b="di" i]) {
+  --n: 2;
+  --b1: 137;                                        /* 0x89 */
+  --b2: calc(192 + var(--rs) * 8 + var(--rd));      /* ModRM = C0 | src<<3 | dst */
+}
+
+/* ---- mov r8, r8 : 88 /r -------------------------------------------------- */
+.ln[op="mov" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],
+                   [a="bh" i]):is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],
+                   [b="dh" i],[b="bh" i]) {
+  --n: 2;
+  --b1: 136;                                        /* 0x88 */
+  --b2: calc(192 + var(--rs8) * 8 + var(--rd8));
+}
+
+/* ---- mov r16, imm16/label : B8+r iw -------------------------------------- */
+.ln[op="mov" i][b]:is([a="ax" i],[a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],[a="si" i],
+                      [a="di" i]):not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],
+                      [b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],
+                      [b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is(
+                      [b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: 3;
+  --b1: calc(184 + var(--rd));                      /* 0xB8 + reg */
+  --b2: mod(var(--imm), 256);                       /* little-endian, */
+  --b3: mod(round(down, var(--imm) / 256), 256);    /* as God and Intel intended */
+}
+
+/* ---- mov r8, imm8 : B0+r ib ---------------------------------------------- */
+.ln[op="mov" i][b]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],
+                      [a="bh" i]):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],
+                      [b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="ax" i],[b="cx" i],[b="dx" i],
+                      [b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is(
+                      [b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: 2;
+  --b1: calc(176 + var(--rd8));                     /* 0xB0 + reg */
+  --b2: mod(var(--imm), 256);
+}
+
+/* ---- mov r16, [mem] : 8B /r ----------------------------------------------
+   No fallback on --rm / --dmod: an unencodable address like [ax] leaves the
+   ModRM byte invalid, the byte cell gets no width, and the CLI reports it. */
+.ln[op="mov" i]:is([a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],[a="si" i],
+                   [a="di" i]):is([mb1],[mbd]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 139;                                        /* 0x8B (ax: see A1 / based rules) */
+  --b2: calc(var(--dmod) + var(--rd) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+
+/* ---- mov [mem], r16 : 89 /r ----------------------------------------------- */
+.ln[op="mov" i]:is([ma1],[mad]):is([b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],
+                   [b="bp" i],[b="si" i],[b="di" i]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 137;                                        /* 0x89 (ax: see A3 / based rules) */
+  --b2: calc(var(--dmod) + var(--rs) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+
+/* ---- mov r8, [mem] : 8A /r ------------------------------------------------ */
+.ln[op="mov" i]:is([a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],
+                   [a="bh" i]):is([mb1],[mbd]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 138;                                        /* 0x8A (al: see A0 / based rules) */
+  --b2: calc(var(--dmod) + var(--rd8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+
+/* ---- mov [mem], r8 : 88 /r ------------------------------------------------ */
+.ln[op="mov" i]:is([ma1],[mad]):is([b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],
+                   [b="ch" i],[b="dh" i],[b="bh" i]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 136;                                        /* 0x88 (al: see A2 / based rules) */
+  --b2: calc(var(--dmod) + var(--rs8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+
+/* ---- ALU r16, [mem] : op /r (the "reversed" opcodes) ----------------------- */
+.ln:is([op="add" i],[op="or" i],[op="and" i],[op="sub" i],[op="xor" i],
+       [op="cmp" i]):is([a="ax" i],[a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],
+       [a="si" i],[a="di" i]):is([mb1],[mbd]) {
+  --n: calc(2 + var(--dsz));
+  --b2: calc(var(--dmod) + var(--rd) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="add" i]:is([mb1],[mbd]) { --b1: 3;  }  /* 0x03 */
+.ln[op="or"  i]:is([mb1],[mbd]) { --b1: 11; }  /* 0x0B */
+.ln[op="and" i]:is([mb1],[mbd]) { --b1: 35; }  /* 0x23 */
+.ln[op="sub" i]:is([mb1],[mbd]) { --b1: 43; }  /* 0x2B */
+.ln[op="xor" i]:is([mb1],[mbd]) { --b1: 51; }  /* 0x33 */
+.ln[op="cmp" i]:is([mb1],[mbd]) { --b1: 59; }  /* 0x3B */
+
+/* ---- ALU [mem], r16 : op /r ------------------------------------------------
+   Same opcode bytes as the register-register forms, so the per-op --b1
+   rules below (keyed on the second operand being a register) cover this. */
+.ln:is([op="add" i],[op="or" i],[op="and" i],[op="sub" i],[op="xor" i],
+       [op="cmp" i]):is([ma1],[mad]):is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],
+       [b="bp" i],[b="si" i],[b="di" i]) {
+  --n: calc(2 + var(--dsz));
+  --b2: calc(var(--dmod) + var(--rs) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+
+/* ---- ALU r16, r16 : op /r ------------------------------------------------ */
+.ln:is([op="add" i],[op="or" i],[op="and" i],[op="sub" i],[op="xor" i],
+       [op="cmp" i]):is([a="ax" i],[a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],[a="si" i],
+       [a="di" i]):is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],
+       [b="di" i]) {
+  --n: 2;
+  --b2: calc(192 + var(--rs) * 8 + var(--rd));
+}
+.ln[op="add" i][b]:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i]) { --b1: 1;  }  /* 0x01 */
+.ln[op="or"  i][b]:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i]) { --b1: 9;  }  /* 0x09 */
+.ln[op="and" i][b]:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i]) { --b1: 33; }  /* 0x21 */
+.ln[op="sub" i][b]:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i]) { --b1: 41; }  /* 0x29 */
+.ln[op="xor" i][b]:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i]) { --b1: 49; }  /* 0x31 */
+.ln[op="cmp" i][b]:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i]) { --b1: 57; }  /* 0x39 */
+
+/* ---- ALU r16, imm16 : 81 /ext iw ----------------------------------------- */
+.ln:is([op="add" i],[op="or" i],[op="and" i],[op="sub" i],[op="xor" i],
+       [op="cmp" i])[b]:is([a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],
+       [a="si" i],[a="di" i]):not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],
+       [b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],
+       [b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is(
+       [b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: calc(4 - var(--ifits));
+  --b1: calc(129 + 2 * var(--ifits));  /* 0x81, or 0x83 sign-extended */                                        /* 0x81 */
+  --b2: calc(var(--ext, 192) + var(--rd));          /* ModRM = C0 | ext<<3 | dst */
+  --b3: mod(var(--imm), 256);
+  --b4: calc(mod(round(down, var(--imm) / 256), 256) - 20000 * var(--ifits));
+}
+.ln[op="add" i] { --ext: 192; }   /* /0 */
+.ln[op="or"  i] { --ext: 200; }   /* /1 */
+.ln[op="adc" i] { --ext: 208; }   /* /2 */
+.ln[op="sbb" i] { --ext: 216; }   /* /3 */
+.ln[op="and" i] { --ext: 224; }   /* /4 */
+.ln[op="sub" i] { --ext: 232; }   /* /5 */
+.ln[op="xor" i] { --ext: 240; }   /* /6 */
+.ln[op="cmp" i] { --ext: 248; }   /* /7 */
+
+/* ---- inc/dec/push/pop r16 : one glorious byte ---------------------------- */
+.ln:is([op="inc" i],[op="dec" i],[op="push" i],
+       [op="pop" i]):is([a="ax" i],[a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],[a="si" i],
+       [a="di" i]):not([b]):not(:is([mb1],[mbd])) {
+  --n: 1;
+  --b1: calc(var(--stem) + var(--rd));
+}
+.ln[op="inc"  i] { --stem: 64; }  /* 0x40+r */
+.ln[op="dec"  i] { --stem: 72; }  /* 0x48+r */
+.ln[op="push" i] { --stem: 80; }  /* 0x50+r */
+.ln[op="pop"  i] { --stem: 88; }  /* 0x58+r */
+
+/* ---- int imm8 : CD ib ----------------------------------------------------- */
+.ln[op="int" i][a]:not([b]):not(:is([mb1],[mbd])) {
+  --n: 2;
+  --b1: 205;                                        /* 0xCD */
+  --b2: mod(var(--imma), 256);
+}
+
+/* ---- short jumps : opc rel8 ----------------------------------------------
+   rel8 = target - (address + 2), and mod() in CSS conveniently produces
+   the two's complement byte for backward jumps. */
+.ln:is([op="je" i],[op="jz" i],[op="jne" i],[op="jnz" i],[op="jb" i],
+       [op="jae" i],[op="jbe" i],[op="ja" i],[op="jl" i],[op="jge" i],[op="jle" i],
+       [op="jg" i],[op="loop" i])[a]:not([b]):not(:is([mb1],[mbd])) {
+  --n: 2;
+  --b2: mod(var(--imma) - var(--at) - 2, 256);
+}
+.ln[op="je"   i] { --b1: 116; }   /* 0x74 */
+.ln[op="jz"   i] { --b1: 116; }
+.ln[op="jne"  i] { --b1: 117; }   /* 0x75 */
+.ln[op="jnz"  i] { --b1: 117; }
+.ln[op="jb"   i] { --b1: 114; }   /* 0x72 */
+.ln[op="jae"  i] { --b1: 115; }   /* 0x73 */
+.ln[op="jbe"  i] { --b1: 118; }   /* 0x76 */
+.ln[op="ja"   i] { --b1: 119; }   /* 0x77 */
+.ln[op="jl"   i] { --b1: 124; }   /* 0x7C */
+.ln[op="jge"  i] { --b1: 125; }   /* 0x7D */
+.ln[op="jle"  i] { --b1: 126; }   /* 0x7E */
+.ln[op="jg"   i] { --b1: 127; }   /* 0x7F */
+.ln[op="loop" i] { --b1: 226; }   /* 0xE2 */
+
+/* ---- jmp : EB rel8, widening itself to E9 rel16 when the target is far.
+   The two encodings are blended by a fits-flag; the CLI just re-renders
+   until the layout stops moving (relaxation, the flexbox way). ---------- */
+.ln[op="jmp" i][a]:not([b]):not(:is([mb1],[mbd])) {
+  --tgtj:  attr(toa type(<number>), attr(a type(<number>), calc(var(--at) + 2)));
+  --jrel:  calc(var(--tgtj) - var(--at) - 2);
+  --jfits: clamp(0, 128 - max(var(--jrel), -1 - var(--jrel)), 1);
+  --n:  calc(3 - var(--jfits));
+  --b1: calc(233 + 2 * var(--jfits));                /* 0xE9 / 0xEB */
+  --b2: calc(mod(var(--jrel), 256) * var(--jfits)
+           + mod(var(--tgtj) - var(--at) - 3, 256) * (1 - var(--jfits)));
+  --b3: calc(mod(round(down, mod(var(--tgtj) - var(--at) - 3, 65536) / 256), 256)
+           - 20000 * var(--jfits));
+}
+
+/* ---- call : E8 rel16 ------------------------------------------------------ */
+.ln[op="call" i][a]:not([b]):not(:is([mb1],[mbd])) {
+  --n: 3;
+  --b1: 232;                                        /* 0xE8 */
+  --b2: mod(mod(var(--imma) - var(--at) - 3, 65536), 256);
+  --b3: mod(round(down, mod(var(--imma) - var(--at) - 3, 65536) / 256), 256);
+}
+
+/* ---- nullary opcodes ------------------------------------------------------ */
+.ln[op="ret" i]:not([a]):not(:is([ma1],[mad])) { --n: 1; --b1: 195; }     /* 0xC3 */
+.ln[op="nop" i]:not([a]):not(:is([ma1],[mad])) { --n: 1; --b1: 144; }     /* 0x90 */
+.ln[op="hlt" i]:not([a]):not(:is([ma1],[mad])) { --n: 1; --b1: 244; }     /* 0xF4 */
+
+/* ==========================================================================
+   ISA expansion: validated byte-for-byte against nasm -O0 (see test/differential.js)
+   ========================================================================== */
+
+/* ==== adc / sbb: the carry-flavoured ALU, all the same shapes ========== */
+.ln[op="adc" i]:is([a="ax" i],[a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],[a="si" i],[a="di" i]):is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i]) {
+  --n: 2;
+  --b1: 17;
+  --b2: calc(192 + var(--rs) * 8 + var(--rd));
+}
+.ln[op="adc" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i]) {
+  --n: 2;
+  --b1: 16;
+  --b2: calc(192 + var(--rs8) * 8 + var(--rd8));
+}
+.ln[op="adc" i]:is([a="ax" i],[a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],[a="si" i],[a="di" i]):is([mb1],[mbd]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 19;
+  --b2: calc(var(--dmod) + var(--rd) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="adc" i]:is([ma1],[mad]):is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 17;
+  --b2: calc(var(--dmod) + var(--rs) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="adc" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):is([mb1],[mbd]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 18;
+  --b2: calc(var(--dmod) + var(--rd8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="adc" i]:is([ma1],[mad]):is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 16;
+  --b2: calc(var(--dmod) + var(--rs8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="adc" i]:is([a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],[a="si" i],[a="di" i])[b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: calc(4 - var(--ifits));
+  --b1: calc(129 + 2 * var(--ifits));  /* 0x81, or 0x83 sign-extended */
+  --b2: calc(var(--ext) + var(--rd));
+  --b3: mod(var(--imm), 256);
+  --b4: calc(mod(round(down, var(--imm) / 256), 256) - 20000 * var(--ifits));
+}
+.ln[op="sbb" i]:is([a="ax" i],[a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],[a="si" i],[a="di" i]):is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i]) {
+  --n: 2;
+  --b1: 25;
+  --b2: calc(192 + var(--rs) * 8 + var(--rd));
+}
+.ln[op="sbb" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i]) {
+  --n: 2;
+  --b1: 24;
+  --b2: calc(192 + var(--rs8) * 8 + var(--rd8));
+}
+.ln[op="sbb" i]:is([a="ax" i],[a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],[a="si" i],[a="di" i]):is([mb1],[mbd]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 27;
+  --b2: calc(var(--dmod) + var(--rd) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="sbb" i]:is([ma1],[mad]):is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 25;
+  --b2: calc(var(--dmod) + var(--rs) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="sbb" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):is([mb1],[mbd]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 26;
+  --b2: calc(var(--dmod) + var(--rd8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="sbb" i]:is([ma1],[mad]):is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 24;
+  --b2: calc(var(--dmod) + var(--rs8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="sbb" i]:is([a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],[a="si" i],[a="di" i])[b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: calc(4 - var(--ifits));
+  --b1: calc(129 + 2 * var(--ifits));  /* 0x81, or 0x83 sign-extended */
+  --b2: calc(var(--ext) + var(--rd));
+  --b3: mod(var(--imm), 256);
+  --b4: calc(mod(round(down, var(--imm) / 256), 256) - 20000 * var(--ifits));
+}
+
+/* ==== 8-bit ALU: same table, half the bits ============================= */
+/* ---- 8-bit ALU r8, r8 : op /r ------------------------------------------------ */
+.ln:is([op="add" i],[op="or" i],[op="adc" i],[op="sbb" i],[op="and" i],[op="sub" i],[op="xor" i],[op="cmp" i]):is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i]) {
+  --n: 2;
+  --b2: calc(192 + var(--rs8) * 8 + var(--rd8));
+}
+.ln[op="add" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i]) {
+  --b1: 0;
+}
+.ln[op="or" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i]) {
+  --b1: 8;
+}
+.ln[op="and" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i]) {
+  --b1: 32;
+}
+.ln[op="sub" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i]) {
+  --b1: 40;
+}
+.ln[op="xor" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i]) {
+  --b1: 48;
+}
+.ln[op="cmp" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i]) {
+  --b1: 56;
+}
+/* ---- 8-bit ALU r8, imm8 : 80 /e ib (al takes the accumulator form) ----------- */
+.ln:is([op="add" i],[op="or" i],[op="adc" i],[op="sbb" i],[op="and" i],[op="sub" i],[op="xor" i],[op="cmp" i]):is([a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i])[b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: 3;
+  --b1: 128;
+  --b2: calc(var(--ext) + var(--rd8));
+  --b3: mod(var(--imm), 256);
+}
+/* 8-bit ALU with memory: op /r both directions */
+.ln[op="add" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):is([mb1],[mbd]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 2;
+  --b2: calc(var(--dmod) + var(--rd8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="add" i]:is([ma1],[mad]):is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 0;
+  --b2: calc(var(--dmod) + var(--rs8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="or" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):is([mb1],[mbd]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 10;
+  --b2: calc(var(--dmod) + var(--rd8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="or" i]:is([ma1],[mad]):is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 8;
+  --b2: calc(var(--dmod) + var(--rs8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="and" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):is([mb1],[mbd]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 34;
+  --b2: calc(var(--dmod) + var(--rd8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="and" i]:is([ma1],[mad]):is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 32;
+  --b2: calc(var(--dmod) + var(--rs8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="sub" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):is([mb1],[mbd]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 42;
+  --b2: calc(var(--dmod) + var(--rd8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="sub" i]:is([ma1],[mad]):is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 40;
+  --b2: calc(var(--dmod) + var(--rs8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="xor" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):is([mb1],[mbd]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 50;
+  --b2: calc(var(--dmod) + var(--rd8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="xor" i]:is([ma1],[mad]):is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 48;
+  --b2: calc(var(--dmod) + var(--rs8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="cmp" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):is([mb1],[mbd]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 58;
+  --b2: calc(var(--dmod) + var(--rd8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="cmp" i]:is([ma1],[mad]):is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 56;
+  --b2: calc(var(--dmod) + var(--rs8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+
+/* ==== accumulator short forms: ax and al get the fast lane, like nasm == */
+/* ---- ALU ax, imm16 : (op<<3)+5 iw -------------------------------------------- */
+.ln:is([op="add" i],[op="or" i],[op="adc" i],[op="sbb" i],[op="and" i],[op="sub" i],[op="xor" i],[op="cmp" i])[a="ax" i][b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: 3;
+  --b1: calc((var(--ext) - 187) * (1 - var(--ifits)) + 131 * var(--ifits));
+  --b2: calc(mod(var(--imm), 256) * (1 - var(--ifits)) + var(--ext) * var(--ifits));
+  --b3: calc(mod(round(down, var(--imm) / 256), 256) * (1 - var(--ifits)) + mod(var(--imm), 256) * var(--ifits));
+}
+/* ---- ALU al, imm8 : (op<<3)+4 ib --------------------------------------------- */
+.ln:is([op="add" i],[op="or" i],[op="adc" i],[op="sbb" i],[op="and" i],[op="sub" i],[op="xor" i],[op="cmp" i])[a="al" i][b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: 2;
+  --b1: calc(var(--ext) - 188);
+  --b2: mod(var(--imm), 256);
+}
+/* ---- mov ax, [direct] : A1 --------------------------------------------------- */
+.ln[op="mov" i][a="ax" i]:is([mbd]:not([mb1]),[mb1]:not(:is([mb1="ax" i],[mb1="cx" i],[mb1="dx" i],[mb1="bx" i],[mb1="sp" i],[mb1="bp" i],[mb1="si" i],[mb1="di" i],[mb1="al" i],[mb1="cl" i],[mb1="dl" i],[mb1="bl" i],[mb1="ah" i],[mb1="ch" i],[mb1="dh" i],[mb1="bh" i])):not([mb2])) {
+  --n: 3;
+  --b1: 161;
+  --b2: mod(var(--mdisp), 256);
+  --b3: mod(round(down, var(--mdisp) / 256), 256);
+}
+/* ---- mov [direct], ax : A3 --------------------------------------------------- */
+.ln[op="mov" i]:is([mad]:not([ma1]),[ma1]:not(:is([ma1="ax" i],[ma1="cx" i],[ma1="dx" i],[ma1="bx" i],[ma1="sp" i],[ma1="bp" i],[ma1="si" i],[ma1="di" i],[ma1="al" i],[ma1="cl" i],[ma1="dl" i],[ma1="bl" i],[ma1="ah" i],[ma1="ch" i],[ma1="dh" i],[ma1="bh" i])):not([ma2]))[b="ax" i] {
+  --n: 3;
+  --b1: 163;
+  --b2: mod(var(--mdisp), 256);
+  --b3: mod(round(down, var(--mdisp) / 256), 256);
+}
+/* ---- mov al, [direct] : A0 --------------------------------------------------- */
+.ln[op="mov" i][a="al" i]:is([mbd]:not([mb1]),[mb1]:not(:is([mb1="ax" i],[mb1="cx" i],[mb1="dx" i],[mb1="bx" i],[mb1="sp" i],[mb1="bp" i],[mb1="si" i],[mb1="di" i],[mb1="al" i],[mb1="cl" i],[mb1="dl" i],[mb1="bl" i],[mb1="ah" i],[mb1="ch" i],[mb1="dh" i],[mb1="bh" i])):not([mb2])) {
+  --n: 3;
+  --b1: 160;
+  --b2: mod(var(--mdisp), 256);
+  --b3: mod(round(down, var(--mdisp) / 256), 256);
+}
+/* ---- mov [direct], al : A2 --------------------------------------------------- */
+.ln[op="mov" i]:is([mad]:not([ma1]),[ma1]:not(:is([ma1="ax" i],[ma1="cx" i],[ma1="dx" i],[ma1="bx" i],[ma1="sp" i],[ma1="bp" i],[ma1="si" i],[ma1="di" i],[ma1="al" i],[ma1="cl" i],[ma1="dl" i],[ma1="bl" i],[ma1="ah" i],[ma1="ch" i],[ma1="dh" i],[ma1="bh" i])):not([ma2]))[b="al" i] {
+  --n: 3;
+  --b1: 162;
+  --b2: mod(var(--mdisp), 256);
+  --b3: mod(round(down, var(--mdisp) / 256), 256);
+}
+/* ---- mov ax, [based] : still 8B ---------------------------------------------- */
+.ln[op="mov" i][a="ax" i]:is([mb1="bx" i],[mb1="bp" i],[mb1="si" i],[mb1="di" i]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 139;
+  --b2: calc(var(--dmod) + var(--rd) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+/* ---- mov [based], ax : still 89 ---------------------------------------------- */
+.ln[op="mov" i]:is([ma1="bx" i],[ma1="bp" i],[ma1="si" i],[ma1="di" i])[b="ax" i] {
+  --n: calc(2 + var(--dsz));
+  --b1: 137;
+  --b2: calc(var(--dmod) + var(--rs) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+/* ---- mov al, [based] : still 8A ---------------------------------------------- */
+.ln[op="mov" i][a="al" i]:is([mb1="bx" i],[mb1="bp" i],[mb1="si" i],[mb1="di" i]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 138;
+  --b2: calc(var(--dmod) + var(--rd8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+/* ---- mov [based], al : still 88 ---------------------------------------------- */
+.ln[op="mov" i]:is([ma1="bx" i],[ma1="bp" i],[ma1="si" i],[ma1="di" i])[b="al" i] {
+  --n: calc(2 + var(--dsz));
+  --b1: 136;
+  --b2: calc(var(--dmod) + var(--rs8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+
+/* ==== test: and, but noncommittal =====================================
+   ==================================================================== */
+.ln[op="test" i]:is([a="ax" i],[a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],[a="si" i],[a="di" i]):is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i]) {
+  --n: 2;
+  --b1: 133;
+  --b2: calc(192 + var(--rs) * 8 + var(--rd));
+}
+.ln[op="test" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i]) {
+  --n: 2;
+  --b1: 132;
+  --b2: calc(192 + var(--rs8) * 8 + var(--rd8));
+}
+.ln[op="test" i]:is([a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],[a="si" i],[a="di" i])[b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: 4;
+  --b1: 247;
+  --b2: calc(192 + var(--rd));
+  --b3: mod(var(--imm), 256);
+  --b4: mod(round(down, var(--imm) / 256), 256);
+}
+.ln[op="test" i]:is([a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i])[b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: 3;
+  --b1: 246;
+  --b2: calc(192 + var(--rd8));
+  --b3: mod(var(--imm), 256);
+}
+.ln[op="test" i][a="ax" i][b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: 3;
+  --b1: 169;
+  --b2: mod(var(--imm), 256);
+  --b3: mod(round(down, var(--imm) / 256), 256);
+}
+.ln[op="test" i][a="al" i][b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: 2;
+  --b1: 168;
+  --b2: mod(var(--imm), 256);
+}
+
+/* ==== xchg: ax gets one-byte swaps, everyone else queues at 86/87 ====== */
+.ln[op="xchg" i][a="ax" i]:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i]) {
+  --n: 1;
+  --b1: calc(144 + var(--rs));
+}
+.ln[op="xchg" i]:is([a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],[a="si" i],[a="di" i])[b="ax" i] {
+  --n: 1;
+  --b1: calc(144 + var(--rd));
+}
+.ln[op="xchg" i]:is([a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],[a="si" i],[a="di" i]):is([b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i]) {
+  --n: 2;
+  --b1: 135;
+  --b2: calc(192 + var(--rd) * 8 + var(--rs));  /* nasm order: reg = 1st operand */
+}
+.ln[op="xchg" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i]) {
+  --n: 2;
+  --b1: 134;
+  --b2: calc(192 + var(--rd8) * 8 + var(--rs8));  /* nasm order: reg = 1st operand */
+}
+
+/* ==== shifts and rotates: by 1 (D0/D1), by cl (D2/D3), by imm (C0/C1) == */
+.ln[op="rol" i] { --shx: 192; }
+.ln[op="ror" i] { --shx: 200; }
+.ln[op="rcl" i] { --shx: 208; }
+.ln[op="rcr" i] { --shx: 216; }
+.ln[op="shl" i] { --shx: 224; }
+.ln[op="sal" i] { --shx: 224; }
+.ln[op="shr" i] { --shx: 232; }
+.ln[op="sar" i] { --shx: 248; }
+.ln:is([op="rol" i],[op="ror" i],[op="rcl" i],[op="rcr" i],[op="shl" i],[op="sal" i],[op="shr" i],[op="sar" i]):is([a="ax" i],[a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],[a="si" i],[a="di" i])[b="1"] {
+  --n: 2;
+  --b1: 209;
+  --b2: calc(var(--shx) + var(--rd));
+}
+.ln:is([op="rol" i],[op="ror" i],[op="rcl" i],[op="rcr" i],[op="shl" i],[op="sal" i],[op="shr" i],[op="sar" i]):is([a="ax" i],[a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],[a="si" i],[a="di" i])[b="cl" i] {
+  --n: 2;
+  --b1: 211;
+  --b2: calc(var(--shx) + var(--rd));
+}
+.ln:is([op="rol" i],[op="ror" i],[op="rcl" i],[op="rcr" i],[op="shl" i],[op="sal" i],[op="shr" i],[op="sar" i]):is([a="ax" i],[a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],[a="si" i],[a="di" i])[b]:not([b="1"]):not([b="cl" i]):not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: 3;
+  --b1: 193;
+  --b2: calc(var(--shx) + var(--rd));
+  --b3: mod(var(--imm), 256);
+}
+.ln:is([op="rol" i],[op="ror" i],[op="rcl" i],[op="rcr" i],[op="shl" i],[op="sal" i],[op="shr" i],[op="sar" i]):is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i])[b="1"] {
+  --n: 2;
+  --b1: 208;
+  --b2: calc(var(--shx) + var(--rd8));
+}
+.ln:is([op="rol" i],[op="ror" i],[op="rcl" i],[op="rcr" i],[op="shl" i],[op="sal" i],[op="shr" i],[op="sar" i]):is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i])[b="cl" i] {
+  --n: 2;
+  --b1: 210;
+  --b2: calc(var(--shx) + var(--rd8));
+}
+.ln:is([op="rol" i],[op="ror" i],[op="rcl" i],[op="rcr" i],[op="shl" i],[op="sal" i],[op="shr" i],[op="sar" i]):is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i])[b]:not([b="1"]):not([b="cl" i]):not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: 3;
+  --b1: 192;
+  --b2: calc(var(--shx) + var(--rd8));
+  --b3: mod(var(--imm), 256);
+}
+
+/* ==== the F7 group: not neg mul imul div idiv =========================== */
+.ln[op="not" i] { --f7x: 208; }
+.ln[op="neg" i] { --f7x: 216; }
+.ln[op="mul" i] { --f7x: 224; }
+.ln[op="imul" i] { --f7x: 232; }
+.ln[op="div" i] { --f7x: 240; }
+.ln[op="idiv" i] { --f7x: 248; }
+.ln:is([op="not" i],[op="neg" i],[op="mul" i],[op="imul" i],[op="div" i],[op="idiv" i]):is([a="ax" i],[a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],[a="si" i],[a="di" i]):not([b]) {
+  --n: 2;
+  --b1: 247;
+  --b2: calc(var(--f7x) + var(--rd));
+}
+.ln:is([op="not" i],[op="neg" i],[op="mul" i],[op="imul" i],[op="div" i],[op="idiv" i]):is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):not([b]) {
+  --n: 2;
+  --b1: 246;
+  --b2: calc(var(--f7x) + var(--rd8));
+}
+
+/* ==== the rest of the 7x conditional-jump row, plus friends ============= */
+.ln:is([op="jo" i],[op="jno" i],[op="jc" i],[op="jnc" i],[op="js" i],[op="jns" i],[op="jp" i],[op="jpe" i],[op="jnp" i],[op="jpo" i],[op="jcxz" i],[op="loope" i],[op="loopz" i],[op="loopne" i],[op="loopnz" i])[a]:not([b]):not(:is([mb1],[mbd])) {
+  --n: 2;
+  --b2: mod(var(--imma) - var(--at) - 2, 256);
+}
+.ln[op="jo" i] { --jop: 112; }
+.ln[op="jno" i] { --jop: 113; }
+.ln[op="jc" i] { --jop: 114; }
+.ln[op="jnc" i] { --jop: 115; }
+.ln[op="js" i] { --jop: 120; }
+.ln[op="jns" i] { --jop: 121; }
+.ln[op="jp" i] { --jop: 122; }
+.ln[op="jpe" i] { --jop: 122; }
+.ln[op="jnp" i] { --jop: 123; }
+.ln[op="jpo" i] { --jop: 123; }
+.ln[op="jcxz" i] { --jop: 227; }
+.ln[op="loope" i] { --jop: 225; }
+.ln[op="loopz" i] { --jop: 225; }
+.ln[op="loopne" i] { --jop: 224; }
+.ln[op="loopnz" i] { --jop: 224; }
+.ln:is([op="jo" i],[op="jno" i],[op="jc" i],[op="jnc" i],[op="js" i],[op="jns" i],[op="jp" i],[op="jpe" i],[op="jnp" i],[op="jpo" i],[op="jcxz" i],[op="loope" i],[op="loopz" i],[op="loopne" i],[op="loopnz" i])[a] { --b1: var(--jop); }
+
+/* ==== segment registers: mov 8E/8C, push/pop ============================ */
+.ln[a="es" i] { --sr: 0; }  .ln[b="es" i] { --srb: 0; }
+.ln[a="cs" i] { --sr: 1; }  .ln[b="cs" i] { --srb: 1; }
+.ln[a="ss" i] { --sr: 2; }  .ln[b="ss" i] { --srb: 2; }
+.ln[a="ds" i] { --sr: 3; }  .ln[b="ds" i] { --srb: 3; }
+/* ---- mov sreg, r16 : 8E /r (cs is not writable, so no rule for it) ----------- */
+.ln[op="mov" i]:is([a="es" i],[a="ss" i],[a="ds" i]):is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i]) {
+  --n: 2;
+  --b1: 142;
+  --b2: calc(192 + var(--sr) * 8 + var(--rs));
+}
+/* ---- mov r16, sreg : 8C /r --------------------------------------------------- */
+.ln[op="mov" i]:is([a="ax" i],[a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],[a="si" i],[a="di" i]):is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i]) {
+  --n: 2;
+  --b1: 140;
+  --b2: calc(192 + var(--srb) * 8 + var(--rd));
+}
+.ln[op="push" i][a="es" i]:not([b]) { --n: 1; --b1: 6; }
+.ln[op="pop" i][a="es" i]:not([b]) { --n: 1; --b1: 7; }
+.ln[op="push" i][a="cs" i]:not([b]) { --n: 1; --b1: 14; }
+.ln[op="push" i][a="ss" i]:not([b]) { --n: 1; --b1: 22; }
+.ln[op="pop" i][a="ss" i]:not([b]) { --n: 1; --b1: 23; }
+.ln[op="push" i][a="ds" i]:not([b]) { --n: 1; --b1: 30; }
+.ln[op="pop" i][a="ds" i]:not([b]) { --n: 1; --b1: 31; }
+
+/* ==== string ops, and rep: the original for-loop ======================== */
+.ln[op="movsb" i]:not([a]) { --n: 1; --b1: 164; }
+.ln[a="movsb" i] { --strop: 164; }
+.ln[op="movsw" i]:not([a]) { --n: 1; --b1: 165; }
+.ln[a="movsw" i] { --strop: 165; }
+.ln[op="cmpsb" i]:not([a]) { --n: 1; --b1: 166; }
+.ln[a="cmpsb" i] { --strop: 166; }
+.ln[op="cmpsw" i]:not([a]) { --n: 1; --b1: 167; }
+.ln[a="cmpsw" i] { --strop: 167; }
+.ln[op="stosb" i]:not([a]) { --n: 1; --b1: 170; }
+.ln[a="stosb" i] { --strop: 170; }
+.ln[op="stosw" i]:not([a]) { --n: 1; --b1: 171; }
+.ln[a="stosw" i] { --strop: 171; }
+.ln[op="lodsb" i]:not([a]) { --n: 1; --b1: 172; }
+.ln[a="lodsb" i] { --strop: 172; }
+.ln[op="lodsw" i]:not([a]) { --n: 1; --b1: 173; }
+.ln[a="lodsw" i] { --strop: 173; }
+.ln[op="scasb" i]:not([a]) { --n: 1; --b1: 174; }
+.ln[a="scasb" i] { --strop: 174; }
+.ln[op="scasw" i]:not([a]) { --n: 1; --b1: 175; }
+.ln[a="scasw" i] { --strop: 175; }
+.ln:is([op="rep" i],[op="repe" i],[op="repz" i])[a]:not([b]) {
+  --n: 2;
+  --b1: 243;
+  --b2: var(--strop);
+}
+.ln:is([op="repne" i],[op="repnz" i])[a]:not([b]) {
+  --n: 2;
+  --b1: 242;
+  --b2: var(--strop);
+}
+
+/* ==== one-byte instructions with strong opinions ======================== */
+.ln[op="pushf" i]:not([a]):not(:is([ma1],[mad])) { --n: 1; --b1: 156; }
+.ln[op="popf" i]:not([a]):not(:is([ma1],[mad])) { --n: 1; --b1: 157; }
+.ln[op="sahf" i]:not([a]):not(:is([ma1],[mad])) { --n: 1; --b1: 158; }
+.ln[op="lahf" i]:not([a]):not(:is([ma1],[mad])) { --n: 1; --b1: 159; }
+.ln[op="cbw" i]:not([a]):not(:is([ma1],[mad])) { --n: 1; --b1: 152; }
+.ln[op="cwd" i]:not([a]):not(:is([ma1],[mad])) { --n: 1; --b1: 153; }
+.ln[op="clc" i]:not([a]):not(:is([ma1],[mad])) { --n: 1; --b1: 248; }
+.ln[op="stc" i]:not([a]):not(:is([ma1],[mad])) { --n: 1; --b1: 249; }
+.ln[op="cmc" i]:not([a]):not(:is([ma1],[mad])) { --n: 1; --b1: 245; }
+.ln[op="cld" i]:not([a]):not(:is([ma1],[mad])) { --n: 1; --b1: 252; }
+.ln[op="std" i]:not([a]):not(:is([ma1],[mad])) { --n: 1; --b1: 253; }
+.ln[op="cli" i]:not([a]):not(:is([ma1],[mad])) { --n: 1; --b1: 250; }
+.ln[op="sti" i]:not([a]):not(:is([ma1],[mad])) { --n: 1; --b1: 251; }
+.ln[op="iret" i]:not([a]):not(:is([ma1],[mad])) { --n: 1; --b1: 207; }
+.ln[op="xlat" i]:not([a]):not(:is([ma1],[mad])) { --n: 1; --b1: 215; }
+.ln[op="int3" i]:not([a]):not(:is([ma1],[mad])) { --n: 1; --b1: 204; }
+
+/* ==== dw: like db, but the cells come in twos ============================ */
+#strip .ln[k="dw"] { width: auto; }
+#strip .ln[k="dw"] > w { display: inline-block; width: 2px; height: 1px; }
+w[n] { --wv: mod(attr(n type(<number>)), 65536); }
+w[s] { --wv: mod(var(--lto), 65536); }        /* symbol: the line's to wire */
+#bytes .ln > w > e { display: inline-block; height: 1px;
+                     width: calc(max(0px, (1000 + var(--ev, -9999)) * 1px)); }
+#bytes .ln > w > e:first-child { --ev: mod(var(--wv), 256); }
+#bytes .ln > w > e:last-child { --ev: mod(round(down, var(--wv) / 256), 256); }
+#list .hex w > e { display: inline; }
+#list .hex w > e:first-child { counter-reset: B calc(mod(var(--wv, 0), 256)); }
+#list .hex w > e:last-child { counter-reset: B calc(mod(round(down, var(--wv, 0) / 256), 256)); }
+#list .hex w > e::before { content: counter(B, hexbyte) " "; }
+
+/* ==== pad: flexbox solves the boot-sector padding equation ==============
+   The wrapper's width is org + target (CSS adds the two attributes); every
+   line inside is flex:none; the pad line is the lone flexible item, so the
+   layout engine hands it exactly (target - code) pixels = bytes of zeros. */
+#strip .padwrap { display: inline-flex;
+  width: calc((attr(o type(<number>), 256) + attr(n type(<number>), 0)) * 1px); }
+#strip .padwrap > .ln { flex: 0 0 auto; }
+#strip .padwrap > .ln[k="pad"] { flex: 1 0 0px; width: auto; }
+#tape .tp[k="pad"] { width: 8ch;
+  background: repeating-linear-gradient(-45deg, #16241a 0 4px, #0b0f0c 4px 8px); }
+
+
+/* ---- db: numeric cells ---------------------------------------------------- */
+d[n] { --v: mod(attr(n type(<number>), 0), 256); }
+
+/* ---- db: character cells --------------------------------------------------
+   CSS cannot turn a character into its char code, so here is the entire
+   printable ASCII table as attribute selectors. This is fine. */
+[c=" "] { --v: 32; }
+[c="!"] { --v: 33; }
+[c='"'] { --v: 34; }
+[c="#"] { --v: 35; }
+[c="$"] { --v: 36; }
+[c="%"] { --v: 37; }
+[c="&"] { --v: 38; }
+[c="'"] { --v: 39; }
+[c="("] { --v: 40; }
+[c=")"] { --v: 41; }
+[c="*"] { --v: 42; }
+[c="+"] { --v: 43; }
+[c=","] { --v: 44; }
+[c="-"] { --v: 45; }
+[c="."] { --v: 46; }
+[c="/"] { --v: 47; }
+[c="0"] { --v: 48; }
+[c="1"] { --v: 49; }
+[c="2"] { --v: 50; }
+[c="3"] { --v: 51; }
+[c="4"] { --v: 52; }
+[c="5"] { --v: 53; }
+[c="6"] { --v: 54; }
+[c="7"] { --v: 55; }
+[c="8"] { --v: 56; }
+[c="9"] { --v: 57; }
+[c=":"] { --v: 58; }
+[c=";"] { --v: 59; }
+[c="<"] { --v: 60; }
+[c="="] { --v: 61; }
+[c=">"] { --v: 62; }
+[c="?"] { --v: 63; }
+[c="@"] { --v: 64; }
+[c="A"] { --v: 65; }
+[c="B"] { --v: 66; }
+[c="C"] { --v: 67; }
+[c="D"] { --v: 68; }
+[c="E"] { --v: 69; }
+[c="F"] { --v: 70; }
+[c="G"] { --v: 71; }
+[c="H"] { --v: 72; }
+[c="I"] { --v: 73; }
+[c="J"] { --v: 74; }
+[c="K"] { --v: 75; }
+[c="L"] { --v: 76; }
+[c="M"] { --v: 77; }
+[c="N"] { --v: 78; }
+[c="O"] { --v: 79; }
+[c="P"] { --v: 80; }
+[c="Q"] { --v: 81; }
+[c="R"] { --v: 82; }
+[c="S"] { --v: 83; }
+[c="T"] { --v: 84; }
+[c="U"] { --v: 85; }
+[c="V"] { --v: 86; }
+[c="W"] { --v: 87; }
+[c="X"] { --v: 88; }
+[c="Y"] { --v: 89; }
+[c="Z"] { --v: 90; }
+[c="["] { --v: 91; }
+[c="\\"] { --v: 92; }
+[c="]"] { --v: 93; }
+[c="^"] { --v: 94; }
+[c="_"] { --v: 95; }
+[c="`"] { --v: 96; }
+[c="a"] { --v: 97; }
+[c="b"] { --v: 98; }
+[c="c"] { --v: 99; }
+[c="d"] { --v: 100; }
+[c="e"] { --v: 101; }
+[c="f"] { --v: 102; }
+[c="g"] { --v: 103; }
+[c="h"] { --v: 104; }
+[c="i"] { --v: 105; }
+[c="j"] { --v: 106; }
+[c="k"] { --v: 107; }
+[c="l"] { --v: 108; }
+[c="m"] { --v: 109; }
+[c="n"] { --v: 110; }
+[c="o"] { --v: 111; }
+[c="p"] { --v: 112; }
+[c="q"] { --v: 113; }
+[c="r"] { --v: 114; }
+[c="s"] { --v: 115; }
+[c="t"] { --v: 116; }
+[c="u"] { --v: 117; }
+[c="v"] { --v: 118; }
+[c="w"] { --v: 119; }
+[c="x"] { --v: 120; }
+[c="y"] { --v: 121; }
+[c="z"] { --v: 122; }
+[c="{"] { --v: 123; }
+[c="|"] { --v: 124; }
+[c="}"] { --v: 125; }
+[c="~"] { --v: 126; }
+
+
+/* ==========================================================================
+   Hexadecimal literals. CSS cannot parse "0x7c" out of an attribute, but the
+   lexer can deal it out as four digit attributes (padded, lowercased), and
+   sixty-four selectors can do the place-value arithmetic. This is fine.
+   ========================================================================== */
+[h1="0"] { --h1v: 0; }
+[h1="1"] { --h1v: 1; }
+[h1="2"] { --h1v: 2; }
+[h1="3"] { --h1v: 3; }
+[h1="4"] { --h1v: 4; }
+[h1="5"] { --h1v: 5; }
+[h1="6"] { --h1v: 6; }
+[h1="7"] { --h1v: 7; }
+[h1="8"] { --h1v: 8; }
+[h1="9"] { --h1v: 9; }
+[h1="a"] { --h1v: 10; }
+[h1="b"] { --h1v: 11; }
+[h1="c"] { --h1v: 12; }
+[h1="d"] { --h1v: 13; }
+[h1="e"] { --h1v: 14; }
+[h1="f"] { --h1v: 15; }
+[h2="0"] { --h2v: 0; }
+[h2="1"] { --h2v: 1; }
+[h2="2"] { --h2v: 2; }
+[h2="3"] { --h2v: 3; }
+[h2="4"] { --h2v: 4; }
+[h2="5"] { --h2v: 5; }
+[h2="6"] { --h2v: 6; }
+[h2="7"] { --h2v: 7; }
+[h2="8"] { --h2v: 8; }
+[h2="9"] { --h2v: 9; }
+[h2="a"] { --h2v: 10; }
+[h2="b"] { --h2v: 11; }
+[h2="c"] { --h2v: 12; }
+[h2="d"] { --h2v: 13; }
+[h2="e"] { --h2v: 14; }
+[h2="f"] { --h2v: 15; }
+[h3="0"] { --h3v: 0; }
+[h3="1"] { --h3v: 1; }
+[h3="2"] { --h3v: 2; }
+[h3="3"] { --h3v: 3; }
+[h3="4"] { --h3v: 4; }
+[h3="5"] { --h3v: 5; }
+[h3="6"] { --h3v: 6; }
+[h3="7"] { --h3v: 7; }
+[h3="8"] { --h3v: 8; }
+[h3="9"] { --h3v: 9; }
+[h3="a"] { --h3v: 10; }
+[h3="b"] { --h3v: 11; }
+[h3="c"] { --h3v: 12; }
+[h3="d"] { --h3v: 13; }
+[h3="e"] { --h3v: 14; }
+[h3="f"] { --h3v: 15; }
+[h4="0"] { --h4v: 0; }
+[h4="1"] { --h4v: 1; }
+[h4="2"] { --h4v: 2; }
+[h4="3"] { --h4v: 3; }
+[h4="4"] { --h4v: 4; }
+[h4="5"] { --h4v: 5; }
+[h4="6"] { --h4v: 6; }
+[h4="7"] { --h4v: 7; }
+[h4="8"] { --h4v: 8; }
+[h4="9"] { --h4v: 9; }
+[h4="a"] { --h4v: 10; }
+[h4="b"] { --h4v: 11; }
+[h4="c"] { --h4v: 12; }
+[h4="d"] { --h4v: 13; }
+[h4="e"] { --h4v: 14; }
+[h4="f"] { --h4v: 15; }
+
+[h1] { --hv0: calc(var(--h1v) * 4096 + var(--h2v) * 256 + var(--h3v) * 16 + var(--h4v));
+       --hv: var(--hv0); }
+[h1][hneg] { --hv: calc(0 - var(--hv0)); }
+
+/* db/dw cells carrying hex literals */
+d[h1] { --v: mod(var(--hv), 256); }
+w[h1] { --wv: mod(var(--hv), 65536); }
+
+/* ==========================================================================
+   equ: constants, resolved by layout. Every equ line becomes an out-of-flow
+   box whose width in pixels IS its value; the CLI reads the symbol table
+   off getBoundingClientRect like everything else.
+   ========================================================================== */
+#consts { position: absolute; top: 200px; left: 0; font-size: 0; white-space: nowrap; }
+#consts .ln { display: inline-block; height: 1px;
+              width: calc(max(0px, var(--cv, 0) * 1px)); }
+.ln[k="equ"] { --cv: attr(n type(<number>), var(--hv, var(--v, 0))); }
+
+/* --------------------------------------------------------------------------
+   Hexadecimal, the hard way: base-16 is just a numeral system, and CSS
+   counters speak arbitrary numeral systems.
+   -------------------------------------------------------------------------- */
+
+@counter-style hexbyte {
+  system: numeric;
+  symbols: "0" "1" "2" "3" "4" "5" "6" "7" "8" "9" "a" "b" "c" "d" "e" "f";
+  pad: 2 "0";
+}
+@counter-style hexword {
+  system: numeric;
+  symbols: "0" "1" "2" "3" "4" "5" "6" "7" "8" "9" "a" "b" "c" "d" "e" "f";
+  pad: 4 "0";
+}
+
+/* --------------------------------------------------------------------------
+   The listing (the part a human gets to look at)
+   -------------------------------------------------------------------------- */
+
+#list {
+  min-height: 100vh;
+  background: #0b0f0c;
+  color: #93d693;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  padding: 2.5rem 3rem;
+  box-sizing: border-box;
+}
+#list header {
+  color: #4e7d52;
+  border-bottom: 1px solid #1e3322;
+  padding-bottom: 0.75rem;
+  margin-bottom: 1.25rem;
+  white-space: pre-wrap;
+}
+#list header b { color: #b5e8b5; font-weight: 600; }
+
+/* phase banner: --show mode narrates by stamping an attribute on <body>;
+   the words themselves are, of course, CSS */
+#phase::before { color: #7db87d; }
+body[phase="pass1"]   #phase::before { content: "PASS 1 — layout engine running; instruction sizes are widths, addresses are x-coordinates"; }
+body[phase="pass2"]   #phase::before { content: "PASS 2 — patching measured label addresses into attributes; the cascade re-encodes as they land"; }
+body[phase="live"]    #phase::before { content: "LIVE — devtools is the frontend now. edit op/a/b/c attributes on any row and the HEX column re-encodes instantly (the source column stays as written — it is history, the hex is the truth)"; color: #d6c76a; }
+body[phase="readout"] #phase::before { content: "READOUT — pulling the binary off the page, one 1000px-plus-value box at a time"; }
+body[phase="done"]    #phase::before { content: "DONE — this page is a binary. edit any attribute in devtools and it reassembles."; }
+
+/* the tape: a visible scale model of #strip, the location counter.
+   box width = encoded size, gold ticks = labels, hatched block = org */
+#tape { margin: 0 0 1.5rem; padding: 6px 0 2px; white-space: nowrap; overflow-x: auto; }
+#tape .tp { display: inline-block; height: 14px; width: calc(var(--n, 0) * 1.25ch);
+            vertical-align: bottom; background: #1d4d28; box-shadow: inset -1px 0 0 #0b0f0c;
+            transition: filter .2s, background-color .2s; }
+#tape .tp:nth-of-type(even) { background: #17552f; }
+#tape .tp[k="db"] { width: auto; background: none; box-shadow: none; }
+#tape .tp[k="db"] d { display: inline-block; width: 1.25ch; height: 14px;
+                      background: #4d431d; box-shadow: inset -1px 0 0 #0b0f0c; }
+#tape .tp[k="org"] { width: 5ch;
+            background: repeating-linear-gradient(45deg, #16241a 0 4px, #0b0f0c 4px 8px); }
+#tape .tp[k="lbl"] { width: 2px; height: 20px; background: #d6c76a;
+                     margin-right: -2px; position: relative; z-index: 1; }
+
+.lrow {
+  display: grid;
+  grid-template-columns: 5ch minmax(13ch, max-content) 1fr;
+  gap: 2.5ch;
+  container-name: row;
+  container-type: normal;
+}
+.lrow:hover { background: #101812; }
+
+/* --show staging: rows not yet fixed up show an unmeasured address, and the
+   pass-2/readout cursors are just classes the CLI flips while the cascade
+   does the actual re-encoding */
+.lrow { transition: background-color .25s; }
+.lrow:is([k="op"],[k="db"],[k="lbl"]):not([at]) .addr::before { content: "\00b7\00b7\00b7\00b7"; color: #3a5a40; }
+.lrow.fixing { background: #1c3a24; }
+.lrow.reading { background: #26401a; }
+.lrow.reading .hex { color: #ffffff; }
+.tp.fixing, .tp.reading { filter: brightness(2); }
+
+/* rows whose attributes were live-edited in devtools: the source column is
+   now historical fiction, so say so */
+.lrow.edited { background: #241f0d; }
+.lrow.edited .hex { color: #ffe08a; }
+.lrow.edited .src { color: #59573f; }
+.lrow.edited .src::after { content: "   ← live-edited: source is what you wrote, hex is what you did"; color: #d6c76a; }
+.tp.edited { background: #8f7a26; }
+
+/* address column: a CSS counter renders var(--at) as hex */
+.addr { color: #55a05f; }
+.lrow[at] .addr { counter-reset: A calc(var(--at, 0)); }
+.lrow[at] .addr::before { content: counter(A, hexword); }
+
+/* machine-code column: counters render the byte vars as hex pairs */
+.hex { color: #e2f7e2; }
+.hex u, .hex d, .hex v { text-decoration: none; font-style: normal; }
+.hex u { display: none; }
+.hex u:nth-of-type(1) { counter-reset: B calc(var(--b1, 0)); }
+.hex u:nth-of-type(2) { counter-reset: B calc(var(--b2, 0)); }
+.hex u:nth-of-type(3) { counter-reset: B calc(var(--b3, 0)); }
+.hex u:nth-of-type(4) { counter-reset: B calc(var(--b4, 0)); }
+.hex u:nth-of-type(5) { counter-reset: B calc(var(--b5, 0)); }
+.hex u:nth-of-type(6) { counter-reset: B calc(var(--b6, 0)); }
+.hex u::before { content: counter(B, hexbyte) " "; }
+.hex v { display: none; }
+.hex v:nth-of-type(1) { counter-reset: B calc(var(--p1, 0)); }
+.hex v:nth-of-type(2) { counter-reset: B calc(var(--p2, 0)); }
+.hex v::before { content: counter(B, hexbyte) " "; }
+
+/* reveal exactly --n byte cells: style queries as an instruction-length bus */
+@container row style(--n: 1) { .hex u:nth-of-type(-n + 1) { display: inline; } }
+@container row style(--n: 2) { .hex u:nth-of-type(-n + 2) { display: inline; } }
+@container row style(--n: 3) { .hex u:nth-of-type(-n + 3) { display: inline; } }
+@container row style(--n: 4) { .hex u:nth-of-type(-n + 4) { display: inline; } }
+@container row style(--n: 5) { .hex u:nth-of-type(-n + 5) { display: inline; } }
+@container row style(--n: 6) { .hex u:nth-of-type(-n + 6) { display: inline; } }
+@container row style(--npfx: 1) { .hex v:nth-of-type(-n + 1) { display: inline; } }
+@container row style(--npfx: 2) { .hex v:nth-of-type(-n + 2) { display: inline; } }
+
+.hex d { counter-reset: B calc(var(--v, 0)); }
+.hex d::before { content: counter(B, hexbyte) " "; }
+
+/* source column */
+.src { white-space: pre; }
+.lrow[k="lbl"] .src { color: #d6c76a; }
+.lrow[k="org"] .src,
+.lrow[k="blank"] .src { color: #4e7d52; }
+
+/* ==========================================================================
+   FULL 8086 COMPLETION
+   Everything below finishes the ISA: prefixes, size-tagged memory forms,
+   indirect and far control flow, BCD, ports. Same idiom as above: an
+   instruction exists iff a selector matches it, bytes are calc().
+   Validated byte-for-byte against nasm -Ox by test/differential.js.
+   ========================================================================== */
+
+/* ---- prefixes: segment override then lock, in nasm's emission order ---- */
+.ln[mseg="es" i] { --segb: 38; }
+.ln[mseg="cs" i] { --segb: 46; }
+.ln[mseg="ss" i] { --segb: 54; }
+.ln[mseg="ds" i] { --segb: 62; }
+.ln[mseg] { --p1: var(--segb); --npfx: 1; }
+.ln[lock]:not([mseg]) { --p1: 240; --npfx: 1; }
+.ln[lock][mseg] { --p2: 240; --npfx: 2; }
+
+/* ---- role-tagged hex literal wires ------------------------------------- */
+[ha1="0"] { --ha1v: 0; }
+[ha1="1"] { --ha1v: 1; }
+[ha1="2"] { --ha1v: 2; }
+[ha1="3"] { --ha1v: 3; }
+[ha1="4"] { --ha1v: 4; }
+[ha1="5"] { --ha1v: 5; }
+[ha1="6"] { --ha1v: 6; }
+[ha1="7"] { --ha1v: 7; }
+[ha1="8"] { --ha1v: 8; }
+[ha1="9"] { --ha1v: 9; }
+[ha1="a"] { --ha1v: 10; }
+[ha1="b"] { --ha1v: 11; }
+[ha1="c"] { --ha1v: 12; }
+[ha1="d"] { --ha1v: 13; }
+[ha1="e"] { --ha1v: 14; }
+[ha1="f"] { --ha1v: 15; }
+[ha2="0"] { --ha2v: 0; }
+[ha2="1"] { --ha2v: 1; }
+[ha2="2"] { --ha2v: 2; }
+[ha2="3"] { --ha2v: 3; }
+[ha2="4"] { --ha2v: 4; }
+[ha2="5"] { --ha2v: 5; }
+[ha2="6"] { --ha2v: 6; }
+[ha2="7"] { --ha2v: 7; }
+[ha2="8"] { --ha2v: 8; }
+[ha2="9"] { --ha2v: 9; }
+[ha2="a"] { --ha2v: 10; }
+[ha2="b"] { --ha2v: 11; }
+[ha2="c"] { --ha2v: 12; }
+[ha2="d"] { --ha2v: 13; }
+[ha2="e"] { --ha2v: 14; }
+[ha2="f"] { --ha2v: 15; }
+[ha3="0"] { --ha3v: 0; }
+[ha3="1"] { --ha3v: 1; }
+[ha3="2"] { --ha3v: 2; }
+[ha3="3"] { --ha3v: 3; }
+[ha3="4"] { --ha3v: 4; }
+[ha3="5"] { --ha3v: 5; }
+[ha3="6"] { --ha3v: 6; }
+[ha3="7"] { --ha3v: 7; }
+[ha3="8"] { --ha3v: 8; }
+[ha3="9"] { --ha3v: 9; }
+[ha3="a"] { --ha3v: 10; }
+[ha3="b"] { --ha3v: 11; }
+[ha3="c"] { --ha3v: 12; }
+[ha3="d"] { --ha3v: 13; }
+[ha3="e"] { --ha3v: 14; }
+[ha3="f"] { --ha3v: 15; }
+[ha4="0"] { --ha4v: 0; }
+[ha4="1"] { --ha4v: 1; }
+[ha4="2"] { --ha4v: 2; }
+[ha4="3"] { --ha4v: 3; }
+[ha4="4"] { --ha4v: 4; }
+[ha4="5"] { --ha4v: 5; }
+[ha4="6"] { --ha4v: 6; }
+[ha4="7"] { --ha4v: 7; }
+[ha4="8"] { --ha4v: 8; }
+[ha4="9"] { --ha4v: 9; }
+[ha4="a"] { --ha4v: 10; }
+[ha4="b"] { --ha4v: 11; }
+[ha4="c"] { --ha4v: 12; }
+[ha4="d"] { --ha4v: 13; }
+[ha4="e"] { --ha4v: 14; }
+[ha4="f"] { --ha4v: 15; }
+[ha1] { --ha0: calc(var(--ha1v) * 4096 + var(--ha2v) * 256 + var(--ha3v) * 16 + var(--ha4v));
+         --hav: var(--ha0); }
+[ha1][haneg] { --hav: calc(0 - var(--ha0)); }
+
+[hb1="0"] { --hb1v: 0; }
+[hb1="1"] { --hb1v: 1; }
+[hb1="2"] { --hb1v: 2; }
+[hb1="3"] { --hb1v: 3; }
+[hb1="4"] { --hb1v: 4; }
+[hb1="5"] { --hb1v: 5; }
+[hb1="6"] { --hb1v: 6; }
+[hb1="7"] { --hb1v: 7; }
+[hb1="8"] { --hb1v: 8; }
+[hb1="9"] { --hb1v: 9; }
+[hb1="a"] { --hb1v: 10; }
+[hb1="b"] { --hb1v: 11; }
+[hb1="c"] { --hb1v: 12; }
+[hb1="d"] { --hb1v: 13; }
+[hb1="e"] { --hb1v: 14; }
+[hb1="f"] { --hb1v: 15; }
+[hb2="0"] { --hb2v: 0; }
+[hb2="1"] { --hb2v: 1; }
+[hb2="2"] { --hb2v: 2; }
+[hb2="3"] { --hb2v: 3; }
+[hb2="4"] { --hb2v: 4; }
+[hb2="5"] { --hb2v: 5; }
+[hb2="6"] { --hb2v: 6; }
+[hb2="7"] { --hb2v: 7; }
+[hb2="8"] { --hb2v: 8; }
+[hb2="9"] { --hb2v: 9; }
+[hb2="a"] { --hb2v: 10; }
+[hb2="b"] { --hb2v: 11; }
+[hb2="c"] { --hb2v: 12; }
+[hb2="d"] { --hb2v: 13; }
+[hb2="e"] { --hb2v: 14; }
+[hb2="f"] { --hb2v: 15; }
+[hb3="0"] { --hb3v: 0; }
+[hb3="1"] { --hb3v: 1; }
+[hb3="2"] { --hb3v: 2; }
+[hb3="3"] { --hb3v: 3; }
+[hb3="4"] { --hb3v: 4; }
+[hb3="5"] { --hb3v: 5; }
+[hb3="6"] { --hb3v: 6; }
+[hb3="7"] { --hb3v: 7; }
+[hb3="8"] { --hb3v: 8; }
+[hb3="9"] { --hb3v: 9; }
+[hb3="a"] { --hb3v: 10; }
+[hb3="b"] { --hb3v: 11; }
+[hb3="c"] { --hb3v: 12; }
+[hb3="d"] { --hb3v: 13; }
+[hb3="e"] { --hb3v: 14; }
+[hb3="f"] { --hb3v: 15; }
+[hb4="0"] { --hb4v: 0; }
+[hb4="1"] { --hb4v: 1; }
+[hb4="2"] { --hb4v: 2; }
+[hb4="3"] { --hb4v: 3; }
+[hb4="4"] { --hb4v: 4; }
+[hb4="5"] { --hb4v: 5; }
+[hb4="6"] { --hb4v: 6; }
+[hb4="7"] { --hb4v: 7; }
+[hb4="8"] { --hb4v: 8; }
+[hb4="9"] { --hb4v: 9; }
+[hb4="a"] { --hb4v: 10; }
+[hb4="b"] { --hb4v: 11; }
+[hb4="c"] { --hb4v: 12; }
+[hb4="d"] { --hb4v: 13; }
+[hb4="e"] { --hb4v: 14; }
+[hb4="f"] { --hb4v: 15; }
+[hb1] { --hb0: calc(var(--hb1v) * 4096 + var(--hb2v) * 256 + var(--hb3v) * 16 + var(--hb4v));
+         --hbv: var(--hb0); }
+[hb1][hbneg] { --hbv: calc(0 - var(--hb0)); }
+
+[hd1="0"] { --hd1v: 0; }
+[hd1="1"] { --hd1v: 1; }
+[hd1="2"] { --hd1v: 2; }
+[hd1="3"] { --hd1v: 3; }
+[hd1="4"] { --hd1v: 4; }
+[hd1="5"] { --hd1v: 5; }
+[hd1="6"] { --hd1v: 6; }
+[hd1="7"] { --hd1v: 7; }
+[hd1="8"] { --hd1v: 8; }
+[hd1="9"] { --hd1v: 9; }
+[hd1="a"] { --hd1v: 10; }
+[hd1="b"] { --hd1v: 11; }
+[hd1="c"] { --hd1v: 12; }
+[hd1="d"] { --hd1v: 13; }
+[hd1="e"] { --hd1v: 14; }
+[hd1="f"] { --hd1v: 15; }
+[hd2="0"] { --hd2v: 0; }
+[hd2="1"] { --hd2v: 1; }
+[hd2="2"] { --hd2v: 2; }
+[hd2="3"] { --hd2v: 3; }
+[hd2="4"] { --hd2v: 4; }
+[hd2="5"] { --hd2v: 5; }
+[hd2="6"] { --hd2v: 6; }
+[hd2="7"] { --hd2v: 7; }
+[hd2="8"] { --hd2v: 8; }
+[hd2="9"] { --hd2v: 9; }
+[hd2="a"] { --hd2v: 10; }
+[hd2="b"] { --hd2v: 11; }
+[hd2="c"] { --hd2v: 12; }
+[hd2="d"] { --hd2v: 13; }
+[hd2="e"] { --hd2v: 14; }
+[hd2="f"] { --hd2v: 15; }
+[hd3="0"] { --hd3v: 0; }
+[hd3="1"] { --hd3v: 1; }
+[hd3="2"] { --hd3v: 2; }
+[hd3="3"] { --hd3v: 3; }
+[hd3="4"] { --hd3v: 4; }
+[hd3="5"] { --hd3v: 5; }
+[hd3="6"] { --hd3v: 6; }
+[hd3="7"] { --hd3v: 7; }
+[hd3="8"] { --hd3v: 8; }
+[hd3="9"] { --hd3v: 9; }
+[hd3="a"] { --hd3v: 10; }
+[hd3="b"] { --hd3v: 11; }
+[hd3="c"] { --hd3v: 12; }
+[hd3="d"] { --hd3v: 13; }
+[hd3="e"] { --hd3v: 14; }
+[hd3="f"] { --hd3v: 15; }
+[hd4="0"] { --hd4v: 0; }
+[hd4="1"] { --hd4v: 1; }
+[hd4="2"] { --hd4v: 2; }
+[hd4="3"] { --hd4v: 3; }
+[hd4="4"] { --hd4v: 4; }
+[hd4="5"] { --hd4v: 5; }
+[hd4="6"] { --hd4v: 6; }
+[hd4="7"] { --hd4v: 7; }
+[hd4="8"] { --hd4v: 8; }
+[hd4="9"] { --hd4v: 9; }
+[hd4="a"] { --hd4v: 10; }
+[hd4="b"] { --hd4v: 11; }
+[hd4="c"] { --hd4v: 12; }
+[hd4="d"] { --hd4v: 13; }
+[hd4="e"] { --hd4v: 14; }
+[hd4="f"] { --hd4v: 15; }
+[hd1] { --hd0: calc(var(--hd1v) * 4096 + var(--hd2v) * 256 + var(--hd3v) * 16 + var(--hd4v));
+         --hdv: var(--hd0); }
+[hd1][hdneg] { --hdv: calc(0 - var(--hd0)); }
+
+/* the operand-decoding block reads --hva/--hvb/--hvd; alias them */
+[ha1] { --hva: var(--hav); }
+[hb1] { --hvb: var(--hbv); }
+[hd1] { --hvd: var(--hdv); }
+
+.ln[op="lea" i]:is([a="ax" i],[a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],[a="si" i],[a="di" i]):is([mb1],[mbd]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 141;
+  --b2: calc(var(--dmod) + var(--rd) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="les" i]:is([a="ax" i],[a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],[a="si" i],[a="di" i]):is([mb1],[mbd]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 196;
+  --b2: calc(var(--dmod) + var(--rd) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="lds" i]:is([a="ax" i],[a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],[a="si" i],[a="di" i]):is([mb1],[mbd]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 197;
+  --b2: calc(var(--dmod) + var(--rd) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="inc" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):not([b]) {
+  --n: 2;
+  --b1: 254;
+  --b2: calc(192 + var(--rd8));
+}
+.ln[op="dec" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):not([b]) {
+  --n: 2;
+  --b1: 254;
+  --b2: calc(200 + var(--rd8));
+}
+.ln[op="inc" i][sz="byte" i]:is([ma1],[mad]):not([b]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 254;
+  --b2: calc(var(--dmod) + 0 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="inc" i][sz="word" i]:is([ma1],[mad]):not([b]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 255;
+  --b2: calc(var(--dmod) + 0 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="dec" i][sz="byte" i]:is([ma1],[mad]):not([b]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 254;
+  --b2: calc(var(--dmod) + 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="dec" i][sz="word" i]:is([ma1],[mad]):not([b]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 255;
+  --b2: calc(var(--dmod) + 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="push" i][sz="word" i]:is([ma1],[mad]):not([b]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 255;
+  --b2: calc(var(--dmod) + 48 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="pop" i][sz="word" i]:is([ma1],[mad]):not([b]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 143;
+  --b2: calc(var(--dmod) + 0 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="mov" i][sz="byte" i]:is([ma1],[mad])[b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: calc(3 + var(--dsz));
+  --b1: 198;
+  --b2: calc(var(--dmod) + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+}
+.ln[op="mov" i][sz="word" i]:is([ma1],[mad])[b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: calc(4 + var(--dsz));
+  --b1: 199;
+  --b2: calc(var(--dmod) + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+  --b6: mod(round(down, mod(var(--imm), 65536) / 256), 256);
+}
+.ln[op="add" i][sz="byte" i]:is([ma1],[mad])[b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: calc(3 + var(--dsz));
+  --b1: 128;
+  --b2: calc(var(--dmod) + (var(--ext) - 192) + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+}
+.ln[op="add" i][sz="word" i]:is([ma1],[mad])[b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: calc(4 + var(--dsz) - var(--ifits));
+  --b1: calc(129 + 2 * var(--ifits));
+  --b2: calc(var(--dmod) + (var(--ext) - 192) + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+  --b6: calc(mod(round(down, mod(var(--imm), 65536) / 256), 256) - 20000 * var(--ifits));
+}
+.ln[op="or" i][sz="byte" i]:is([ma1],[mad])[b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: calc(3 + var(--dsz));
+  --b1: 128;
+  --b2: calc(var(--dmod) + (var(--ext) - 192) + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+}
+.ln[op="or" i][sz="word" i]:is([ma1],[mad])[b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: calc(4 + var(--dsz) - var(--ifits));
+  --b1: calc(129 + 2 * var(--ifits));
+  --b2: calc(var(--dmod) + (var(--ext) - 192) + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+  --b6: calc(mod(round(down, mod(var(--imm), 65536) / 256), 256) - 20000 * var(--ifits));
+}
+.ln[op="adc" i][sz="byte" i]:is([ma1],[mad])[b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: calc(3 + var(--dsz));
+  --b1: 128;
+  --b2: calc(var(--dmod) + (var(--ext) - 192) + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+}
+.ln[op="adc" i][sz="word" i]:is([ma1],[mad])[b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: calc(4 + var(--dsz) - var(--ifits));
+  --b1: calc(129 + 2 * var(--ifits));
+  --b2: calc(var(--dmod) + (var(--ext) - 192) + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+  --b6: calc(mod(round(down, mod(var(--imm), 65536) / 256), 256) - 20000 * var(--ifits));
+}
+.ln[op="sbb" i][sz="byte" i]:is([ma1],[mad])[b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: calc(3 + var(--dsz));
+  --b1: 128;
+  --b2: calc(var(--dmod) + (var(--ext) - 192) + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+}
+.ln[op="sbb" i][sz="word" i]:is([ma1],[mad])[b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: calc(4 + var(--dsz) - var(--ifits));
+  --b1: calc(129 + 2 * var(--ifits));
+  --b2: calc(var(--dmod) + (var(--ext) - 192) + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+  --b6: calc(mod(round(down, mod(var(--imm), 65536) / 256), 256) - 20000 * var(--ifits));
+}
+.ln[op="and" i][sz="byte" i]:is([ma1],[mad])[b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: calc(3 + var(--dsz));
+  --b1: 128;
+  --b2: calc(var(--dmod) + (var(--ext) - 192) + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+}
+.ln[op="and" i][sz="word" i]:is([ma1],[mad])[b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: calc(4 + var(--dsz) - var(--ifits));
+  --b1: calc(129 + 2 * var(--ifits));
+  --b2: calc(var(--dmod) + (var(--ext) - 192) + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+  --b6: calc(mod(round(down, mod(var(--imm), 65536) / 256), 256) - 20000 * var(--ifits));
+}
+.ln[op="sub" i][sz="byte" i]:is([ma1],[mad])[b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: calc(3 + var(--dsz));
+  --b1: 128;
+  --b2: calc(var(--dmod) + (var(--ext) - 192) + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+}
+.ln[op="sub" i][sz="word" i]:is([ma1],[mad])[b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: calc(4 + var(--dsz) - var(--ifits));
+  --b1: calc(129 + 2 * var(--ifits));
+  --b2: calc(var(--dmod) + (var(--ext) - 192) + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+  --b6: calc(mod(round(down, mod(var(--imm), 65536) / 256), 256) - 20000 * var(--ifits));
+}
+.ln[op="xor" i][sz="byte" i]:is([ma1],[mad])[b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: calc(3 + var(--dsz));
+  --b1: 128;
+  --b2: calc(var(--dmod) + (var(--ext) - 192) + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+}
+.ln[op="xor" i][sz="word" i]:is([ma1],[mad])[b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: calc(4 + var(--dsz) - var(--ifits));
+  --b1: calc(129 + 2 * var(--ifits));
+  --b2: calc(var(--dmod) + (var(--ext) - 192) + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+  --b6: calc(mod(round(down, mod(var(--imm), 65536) / 256), 256) - 20000 * var(--ifits));
+}
+.ln[op="cmp" i][sz="byte" i]:is([ma1],[mad])[b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: calc(3 + var(--dsz));
+  --b1: 128;
+  --b2: calc(var(--dmod) + (var(--ext) - 192) + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+}
+.ln[op="cmp" i][sz="word" i]:is([ma1],[mad])[b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: calc(4 + var(--dsz) - var(--ifits));
+  --b1: calc(129 + 2 * var(--ifits));
+  --b2: calc(var(--dmod) + (var(--ext) - 192) + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+  --b6: calc(mod(round(down, mod(var(--imm), 65536) / 256), 256) - 20000 * var(--ifits));
+}
+.ln[op="add" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):is([mb1],[mbd]) {
+  --n: calc(2 + var(--dsz));
+  --b1: calc(var(--ext) - 190);
+  --b2: calc(var(--dmod) + var(--rd8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="add" i]:is([ma1],[mad]):is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i]) {
+  --n: calc(2 + var(--dsz));
+  --b1: calc(var(--ext) - 192);
+  --b2: calc(var(--dmod) + var(--rs8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="or" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):is([mb1],[mbd]) {
+  --n: calc(2 + var(--dsz));
+  --b1: calc(var(--ext) - 190);
+  --b2: calc(var(--dmod) + var(--rd8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="or" i]:is([ma1],[mad]):is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i]) {
+  --n: calc(2 + var(--dsz));
+  --b1: calc(var(--ext) - 192);
+  --b2: calc(var(--dmod) + var(--rs8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="adc" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):is([mb1],[mbd]) {
+  --n: calc(2 + var(--dsz));
+  --b1: calc(var(--ext) - 190);
+  --b2: calc(var(--dmod) + var(--rd8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="adc" i]:is([ma1],[mad]):is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i]) {
+  --n: calc(2 + var(--dsz));
+  --b1: calc(var(--ext) - 192);
+  --b2: calc(var(--dmod) + var(--rs8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="sbb" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):is([mb1],[mbd]) {
+  --n: calc(2 + var(--dsz));
+  --b1: calc(var(--ext) - 190);
+  --b2: calc(var(--dmod) + var(--rd8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="sbb" i]:is([ma1],[mad]):is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i]) {
+  --n: calc(2 + var(--dsz));
+  --b1: calc(var(--ext) - 192);
+  --b2: calc(var(--dmod) + var(--rs8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="and" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):is([mb1],[mbd]) {
+  --n: calc(2 + var(--dsz));
+  --b1: calc(var(--ext) - 190);
+  --b2: calc(var(--dmod) + var(--rd8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="and" i]:is([ma1],[mad]):is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i]) {
+  --n: calc(2 + var(--dsz));
+  --b1: calc(var(--ext) - 192);
+  --b2: calc(var(--dmod) + var(--rs8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="sub" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):is([mb1],[mbd]) {
+  --n: calc(2 + var(--dsz));
+  --b1: calc(var(--ext) - 190);
+  --b2: calc(var(--dmod) + var(--rd8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="sub" i]:is([ma1],[mad]):is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i]) {
+  --n: calc(2 + var(--dsz));
+  --b1: calc(var(--ext) - 192);
+  --b2: calc(var(--dmod) + var(--rs8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="xor" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):is([mb1],[mbd]) {
+  --n: calc(2 + var(--dsz));
+  --b1: calc(var(--ext) - 190);
+  --b2: calc(var(--dmod) + var(--rd8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="xor" i]:is([ma1],[mad]):is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i]) {
+  --n: calc(2 + var(--dsz));
+  --b1: calc(var(--ext) - 192);
+  --b2: calc(var(--dmod) + var(--rs8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="cmp" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):is([mb1],[mbd]) {
+  --n: calc(2 + var(--dsz));
+  --b1: calc(var(--ext) - 190);
+  --b2: calc(var(--dmod) + var(--rd8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="cmp" i]:is([ma1],[mad]):is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i]) {
+  --n: calc(2 + var(--dsz));
+  --b1: calc(var(--ext) - 192);
+  --b2: calc(var(--dmod) + var(--rs8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="test" i]:is([ma1],[mad]):is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 133;
+  --b2: calc(var(--dmod) + var(--rs) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="test" i]:is([a="ax" i],[a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],[a="si" i],[a="di" i]):is([mb1],[mbd]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 133;
+  --b2: calc(var(--dmod) + var(--rd) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="test" i]:is([ma1],[mad]):is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 132;
+  --b2: calc(var(--dmod) + var(--rs8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="test" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):is([mb1],[mbd]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 132;
+  --b2: calc(var(--dmod) + var(--rd8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="test" i][sz="byte" i]:is([ma1],[mad])[b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: calc(3 + var(--dsz));
+  --b1: 246;
+  --b2: calc(var(--dmod) + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+}
+.ln[op="test" i][sz="word" i]:is([ma1],[mad])[b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: calc(4 + var(--dsz));
+  --b1: 247;
+  --b2: calc(var(--dmod) + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+  --b6: mod(round(down, mod(var(--imm), 65536) / 256), 256);
+}
+.ln[op="not" i][sz="byte" i]:is([ma1],[mad]):not([b]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 246;
+  --b2: calc(var(--dmod) + 16 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="not" i][sz="word" i]:is([ma1],[mad]):not([b]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 247;
+  --b2: calc(var(--dmod) + 16 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="neg" i][sz="byte" i]:is([ma1],[mad]):not([b]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 246;
+  --b2: calc(var(--dmod) + 24 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="neg" i][sz="word" i]:is([ma1],[mad]):not([b]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 247;
+  --b2: calc(var(--dmod) + 24 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="mul" i][sz="byte" i]:is([ma1],[mad]):not([b]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 246;
+  --b2: calc(var(--dmod) + 32 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="mul" i][sz="word" i]:is([ma1],[mad]):not([b]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 247;
+  --b2: calc(var(--dmod) + 32 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="imul" i][sz="byte" i]:is([ma1],[mad]):not([b]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 246;
+  --b2: calc(var(--dmod) + 40 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="imul" i][sz="word" i]:is([ma1],[mad]):not([b]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 247;
+  --b2: calc(var(--dmod) + 40 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="div" i][sz="byte" i]:is([ma1],[mad]):not([b]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 246;
+  --b2: calc(var(--dmod) + 48 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="div" i][sz="word" i]:is([ma1],[mad]):not([b]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 247;
+  --b2: calc(var(--dmod) + 48 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="idiv" i][sz="byte" i]:is([ma1],[mad]):not([b]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 246;
+  --b2: calc(var(--dmod) + 56 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="idiv" i][sz="word" i]:is([ma1],[mad]):not([b]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 247;
+  --b2: calc(var(--dmod) + 56 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="rol" i][sz="byte" i]:is([ma1],[mad])[b="1"] {
+  --n: calc(2 + var(--dsz));
+  --b1: 208;
+  --b2: calc(var(--dmod) + 0 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="rol" i][sz="byte" i]:is([ma1],[mad])[b="cl" i] {
+  --n: calc(2 + var(--dsz));
+  --b1: 210;
+  --b2: calc(var(--dmod) + 0 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="rol" i][sz="byte" i]:is([ma1],[mad])[b]:not([b="1"]):not([b="cl" i]) {
+  --n: calc(3 + var(--dsz));
+  --b1: 192;
+  --b2: calc(var(--dmod) + 0 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+}
+.ln[op="rol" i][sz="word" i]:is([ma1],[mad])[b="1"] {
+  --n: calc(2 + var(--dsz));
+  --b1: 209;
+  --b2: calc(var(--dmod) + 0 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="rol" i][sz="word" i]:is([ma1],[mad])[b="cl" i] {
+  --n: calc(2 + var(--dsz));
+  --b1: 211;
+  --b2: calc(var(--dmod) + 0 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="rol" i][sz="word" i]:is([ma1],[mad])[b]:not([b="1"]):not([b="cl" i]) {
+  --n: calc(3 + var(--dsz));
+  --b1: 193;
+  --b2: calc(var(--dmod) + 0 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+}
+.ln[op="ror" i][sz="byte" i]:is([ma1],[mad])[b="1"] {
+  --n: calc(2 + var(--dsz));
+  --b1: 208;
+  --b2: calc(var(--dmod) + 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="ror" i][sz="byte" i]:is([ma1],[mad])[b="cl" i] {
+  --n: calc(2 + var(--dsz));
+  --b1: 210;
+  --b2: calc(var(--dmod) + 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="ror" i][sz="byte" i]:is([ma1],[mad])[b]:not([b="1"]):not([b="cl" i]) {
+  --n: calc(3 + var(--dsz));
+  --b1: 192;
+  --b2: calc(var(--dmod) + 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+}
+.ln[op="ror" i][sz="word" i]:is([ma1],[mad])[b="1"] {
+  --n: calc(2 + var(--dsz));
+  --b1: 209;
+  --b2: calc(var(--dmod) + 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="ror" i][sz="word" i]:is([ma1],[mad])[b="cl" i] {
+  --n: calc(2 + var(--dsz));
+  --b1: 211;
+  --b2: calc(var(--dmod) + 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="ror" i][sz="word" i]:is([ma1],[mad])[b]:not([b="1"]):not([b="cl" i]) {
+  --n: calc(3 + var(--dsz));
+  --b1: 193;
+  --b2: calc(var(--dmod) + 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+}
+.ln[op="rcl" i][sz="byte" i]:is([ma1],[mad])[b="1"] {
+  --n: calc(2 + var(--dsz));
+  --b1: 208;
+  --b2: calc(var(--dmod) + 16 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="rcl" i][sz="byte" i]:is([ma1],[mad])[b="cl" i] {
+  --n: calc(2 + var(--dsz));
+  --b1: 210;
+  --b2: calc(var(--dmod) + 16 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="rcl" i][sz="byte" i]:is([ma1],[mad])[b]:not([b="1"]):not([b="cl" i]) {
+  --n: calc(3 + var(--dsz));
+  --b1: 192;
+  --b2: calc(var(--dmod) + 16 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+}
+.ln[op="rcl" i][sz="word" i]:is([ma1],[mad])[b="1"] {
+  --n: calc(2 + var(--dsz));
+  --b1: 209;
+  --b2: calc(var(--dmod) + 16 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="rcl" i][sz="word" i]:is([ma1],[mad])[b="cl" i] {
+  --n: calc(2 + var(--dsz));
+  --b1: 211;
+  --b2: calc(var(--dmod) + 16 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="rcl" i][sz="word" i]:is([ma1],[mad])[b]:not([b="1"]):not([b="cl" i]) {
+  --n: calc(3 + var(--dsz));
+  --b1: 193;
+  --b2: calc(var(--dmod) + 16 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+}
+.ln[op="rcr" i][sz="byte" i]:is([ma1],[mad])[b="1"] {
+  --n: calc(2 + var(--dsz));
+  --b1: 208;
+  --b2: calc(var(--dmod) + 24 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="rcr" i][sz="byte" i]:is([ma1],[mad])[b="cl" i] {
+  --n: calc(2 + var(--dsz));
+  --b1: 210;
+  --b2: calc(var(--dmod) + 24 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="rcr" i][sz="byte" i]:is([ma1],[mad])[b]:not([b="1"]):not([b="cl" i]) {
+  --n: calc(3 + var(--dsz));
+  --b1: 192;
+  --b2: calc(var(--dmod) + 24 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+}
+.ln[op="rcr" i][sz="word" i]:is([ma1],[mad])[b="1"] {
+  --n: calc(2 + var(--dsz));
+  --b1: 209;
+  --b2: calc(var(--dmod) + 24 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="rcr" i][sz="word" i]:is([ma1],[mad])[b="cl" i] {
+  --n: calc(2 + var(--dsz));
+  --b1: 211;
+  --b2: calc(var(--dmod) + 24 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="rcr" i][sz="word" i]:is([ma1],[mad])[b]:not([b="1"]):not([b="cl" i]) {
+  --n: calc(3 + var(--dsz));
+  --b1: 193;
+  --b2: calc(var(--dmod) + 24 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+}
+.ln[op="shl" i][sz="byte" i]:is([ma1],[mad])[b="1"] {
+  --n: calc(2 + var(--dsz));
+  --b1: 208;
+  --b2: calc(var(--dmod) + 32 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="shl" i][sz="byte" i]:is([ma1],[mad])[b="cl" i] {
+  --n: calc(2 + var(--dsz));
+  --b1: 210;
+  --b2: calc(var(--dmod) + 32 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="shl" i][sz="byte" i]:is([ma1],[mad])[b]:not([b="1"]):not([b="cl" i]) {
+  --n: calc(3 + var(--dsz));
+  --b1: 192;
+  --b2: calc(var(--dmod) + 32 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+}
+.ln[op="shl" i][sz="word" i]:is([ma1],[mad])[b="1"] {
+  --n: calc(2 + var(--dsz));
+  --b1: 209;
+  --b2: calc(var(--dmod) + 32 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="shl" i][sz="word" i]:is([ma1],[mad])[b="cl" i] {
+  --n: calc(2 + var(--dsz));
+  --b1: 211;
+  --b2: calc(var(--dmod) + 32 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="shl" i][sz="word" i]:is([ma1],[mad])[b]:not([b="1"]):not([b="cl" i]) {
+  --n: calc(3 + var(--dsz));
+  --b1: 193;
+  --b2: calc(var(--dmod) + 32 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+}
+.ln[op="sal" i][sz="byte" i]:is([ma1],[mad])[b="1"] {
+  --n: calc(2 + var(--dsz));
+  --b1: 208;
+  --b2: calc(var(--dmod) + 32 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="sal" i][sz="byte" i]:is([ma1],[mad])[b="cl" i] {
+  --n: calc(2 + var(--dsz));
+  --b1: 210;
+  --b2: calc(var(--dmod) + 32 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="sal" i][sz="byte" i]:is([ma1],[mad])[b]:not([b="1"]):not([b="cl" i]) {
+  --n: calc(3 + var(--dsz));
+  --b1: 192;
+  --b2: calc(var(--dmod) + 32 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+}
+.ln[op="sal" i][sz="word" i]:is([ma1],[mad])[b="1"] {
+  --n: calc(2 + var(--dsz));
+  --b1: 209;
+  --b2: calc(var(--dmod) + 32 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="sal" i][sz="word" i]:is([ma1],[mad])[b="cl" i] {
+  --n: calc(2 + var(--dsz));
+  --b1: 211;
+  --b2: calc(var(--dmod) + 32 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="sal" i][sz="word" i]:is([ma1],[mad])[b]:not([b="1"]):not([b="cl" i]) {
+  --n: calc(3 + var(--dsz));
+  --b1: 193;
+  --b2: calc(var(--dmod) + 32 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+}
+.ln[op="shr" i][sz="byte" i]:is([ma1],[mad])[b="1"] {
+  --n: calc(2 + var(--dsz));
+  --b1: 208;
+  --b2: calc(var(--dmod) + 40 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="shr" i][sz="byte" i]:is([ma1],[mad])[b="cl" i] {
+  --n: calc(2 + var(--dsz));
+  --b1: 210;
+  --b2: calc(var(--dmod) + 40 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="shr" i][sz="byte" i]:is([ma1],[mad])[b]:not([b="1"]):not([b="cl" i]) {
+  --n: calc(3 + var(--dsz));
+  --b1: 192;
+  --b2: calc(var(--dmod) + 40 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+}
+.ln[op="shr" i][sz="word" i]:is([ma1],[mad])[b="1"] {
+  --n: calc(2 + var(--dsz));
+  --b1: 209;
+  --b2: calc(var(--dmod) + 40 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="shr" i][sz="word" i]:is([ma1],[mad])[b="cl" i] {
+  --n: calc(2 + var(--dsz));
+  --b1: 211;
+  --b2: calc(var(--dmod) + 40 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="shr" i][sz="word" i]:is([ma1],[mad])[b]:not([b="1"]):not([b="cl" i]) {
+  --n: calc(3 + var(--dsz));
+  --b1: 193;
+  --b2: calc(var(--dmod) + 40 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+}
+.ln[op="sar" i][sz="byte" i]:is([ma1],[mad])[b="1"] {
+  --n: calc(2 + var(--dsz));
+  --b1: 208;
+  --b2: calc(var(--dmod) + 56 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="sar" i][sz="byte" i]:is([ma1],[mad])[b="cl" i] {
+  --n: calc(2 + var(--dsz));
+  --b1: 210;
+  --b2: calc(var(--dmod) + 56 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="sar" i][sz="byte" i]:is([ma1],[mad])[b]:not([b="1"]):not([b="cl" i]) {
+  --n: calc(3 + var(--dsz));
+  --b1: 192;
+  --b2: calc(var(--dmod) + 56 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+}
+.ln[op="sar" i][sz="word" i]:is([ma1],[mad])[b="1"] {
+  --n: calc(2 + var(--dsz));
+  --b1: 209;
+  --b2: calc(var(--dmod) + 56 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="sar" i][sz="word" i]:is([ma1],[mad])[b="cl" i] {
+  --n: calc(2 + var(--dsz));
+  --b1: 211;
+  --b2: calc(var(--dmod) + 56 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="sar" i][sz="word" i]:is([ma1],[mad])[b]:not([b="1"]):not([b="cl" i]) {
+  --n: calc(3 + var(--dsz));
+  --b1: 193;
+  --b2: calc(var(--dmod) + 56 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+  --b5: mod(var(--imm), 256);
+}
+.ln[op="xchg" i]:is([a="ax" i],[a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],[a="si" i],[a="di" i]):is([mb1],[mbd]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 135;
+  --b2: calc(var(--dmod) + var(--rd) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="xchg" i]:is([ma1],[mad]):is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 135;
+  --b2: calc(var(--dmod) + var(--rs) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="xchg" i]:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i]):is([mb1],[mbd]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 134;
+  --b2: calc(var(--dmod) + var(--rd8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="xchg" i]:is([ma1],[mad]):is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 134;
+  --b2: calc(var(--dmod) + var(--rs8) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="mov" i]:is([ma1],[mad]):is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 140;
+  --b2: calc(var(--dmod) + var(--srb) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="mov" i]:is([a="es" i],[a="cs" i],[a="ss" i],[a="ds" i]):is([mb1],[mbd]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 142;
+  --b2: calc(var(--dmod) + var(--sr) * 8 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="call" i][a]:is([a="ax" i],[a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],[a="si" i],[a="di" i]):not([b]) {
+  --n: 2;
+  --b1: 255;
+  --b2: calc(208 + var(--rd));
+  --b3: -20000;
+}
+.ln[op="jmp" i][a]:is([a="ax" i],[a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],[a="si" i],[a="di" i]):not([b]) {
+  --n: 2;
+  --b1: 255;
+  --b2: calc(224 + var(--rd));
+  --b3: -20000;
+}
+.ln[op="call" i]:is([ma1],[mad]):not([b]):not([sz="far" i]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 255;
+  --b2: calc(var(--dmod) + 16 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="call" i][sz="far" i]:is([ma1],[mad]):not([b]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 255;
+  --b2: calc(var(--dmod) + 24 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="jmp" i]:is([ma1],[mad]):not([b]):not([sz="far" i]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 255;
+  --b2: calc(var(--dmod) + 32 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[op="jmp" i][sz="far" i]:is([ma1],[mad]):not([b]) {
+  --n: calc(2 + var(--dsz));
+  --b1: 255;
+  --b2: calc(var(--dmod) + 40 + var(--rm));
+  --b3: calc(mod(var(--mdisp), 256) - 20000 * var(--z3));
+  --b4: calc(mod(round(down, var(--mdisp) / 256), 256) - 20000 * var(--z4));
+}
+.ln[fseg] { --fsegv: attr(fseg type(<number>), var(--hva, 0));
+            --foffv: attr(foff type(<number>), var(--hvb, 0)); }
+.ln[op="call" i][fseg] {
+  --n: 5;
+  --b1: 154;
+  --b2: mod(var(--foffv), 256);
+  --b3: mod(round(down, mod(var(--foffv), 65536) / 256), 256);
+  --b4: mod(var(--fsegv), 256);
+  --b5: mod(round(down, mod(var(--fsegv), 65536) / 256), 256);
+}
+.ln[op="jmp" i][fseg] {
+  --n: 5;
+  --b1: 234;
+  --b2: mod(var(--foffv), 256);
+  --b3: mod(round(down, mod(var(--foffv), 65536) / 256), 256);
+  --b4: mod(var(--fsegv), 256);
+  --b5: mod(round(down, mod(var(--fsegv), 65536) / 256), 256);
+}
+.ln[op="ret" i][a]:not([b]):not(:is([ma1],[mad])) {
+  --n: 3;
+  --b1: 194;
+  --b2: mod(var(--imma), 256);
+  --b3: mod(round(down, mod(var(--imma), 65536) / 256), 256);
+}
+.ln[op="retf" i]:not([a]):not(:is([ma1],[mad])) {
+  --n: 1;
+  --b1: 203;
+}
+.ln[op="retf" i][a]:not([b]):not(:is([ma1],[mad])) {
+  --n: 3;
+  --b1: 202;
+  --b2: mod(var(--imma), 256);
+  --b3: mod(round(down, mod(var(--imma), 65536) / 256), 256);
+}
+.ln[op="in" i][a="al" i][b="dx" i] {
+  --n: 1;
+  --b1: 236;
+}
+.ln[op="in" i][a="ax" i][b="dx" i] {
+  --n: 1;
+  --b1: 237;
+}
+.ln[op="in" i][a="al" i][b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: 2;
+  --b1: 228;
+  --b2: mod(var(--imm), 256);
+}
+.ln[op="in" i][a="ax" i][b]:not(:is([b="ax" i],[b="cx" i],[b="dx" i],[b="bx" i],[b="sp" i],[b="bp" i],[b="si" i],[b="di" i])):not(:is([b="al" i],[b="cl" i],[b="dl" i],[b="bl" i],[b="ah" i],[b="ch" i],[b="dh" i],[b="bh" i])):not(:is([b="es" i],[b="cs" i],[b="ss" i],[b="ds" i])) {
+  --n: 2;
+  --b1: 229;
+  --b2: mod(var(--imm), 256);
+}
+.ln[op="out" i][a="dx" i][b="al" i] {
+  --n: 1;
+  --b1: 238;
+}
+.ln[op="out" i][a="dx" i][b="ax" i] {
+  --n: 1;
+  --b1: 239;
+}
+.ln[op="out" i][a]:not(:is([a="ax" i],[a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],[a="si" i],[a="di" i])):not(:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i])):not(:is([a="es" i],[a="cs" i],[a="ss" i],[a="ds" i]))[b="al" i] {
+  --n: 2;
+  --b1: 230;
+  --b2: mod(var(--imma), 256);
+}
+.ln[op="out" i][a]:not(:is([a="ax" i],[a="cx" i],[a="dx" i],[a="bx" i],[a="sp" i],[a="bp" i],[a="si" i],[a="di" i])):not(:is([a="al" i],[a="cl" i],[a="dl" i],[a="bl" i],[a="ah" i],[a="ch" i],[a="dh" i],[a="bh" i])):not(:is([a="es" i],[a="cs" i],[a="ss" i],[a="ds" i]))[b="ax" i] {
+  --n: 2;
+  --b1: 231;
+  --b2: mod(var(--imma), 256);
+}
+.ln[op="aaa" i]:not([a]):not(:is([ma1],[mad])) {
+  --n: 1;
+  --b1: 55;
+}
+.ln[op="aas" i]:not([a]):not(:is([ma1],[mad])) {
+  --n: 1;
+  --b1: 63;
+}
+.ln[op="daa" i]:not([a]):not(:is([ma1],[mad])) {
+  --n: 1;
+  --b1: 39;
+}
+.ln[op="das" i]:not([a]):not(:is([ma1],[mad])) {
+  --n: 1;
+  --b1: 47;
+}
+.ln[op="into" i]:not([a]):not(:is([ma1],[mad])) {
+  --n: 1;
+  --b1: 206;
+}
+.ln[op="wait" i]:not([a]):not(:is([ma1],[mad])) {
+  --n: 1;
+  --b1: 155;
+}
+.ln[op="xlatb" i]:not([a]):not(:is([ma1],[mad])) {
+  --n: 1;
+  --b1: 215;
+}
+.ln[op="aam" i]:not([a]):not(:is([ma1],[mad])) {
+  --n: 2;
+  --b1: 212;
+  --b2: 10;
+}
+.ln[op="aam" i][a]:not([b]):not(:is([ma1],[mad])) {
+  --n: 2;
+  --b1: 212;
+  --b2: mod(var(--imma), 256);
+}
+.ln[op="aad" i]:not([a]):not(:is([ma1],[mad])) {
+  --n: 2;
+  --b1: 213;
+  --b2: 10;
+}
+.ln[op="aad" i][a]:not([b]):not(:is([ma1],[mad])) {
+  --n: 2;
+  --b1: 213;
+  --b2: mod(var(--imma), 256);
+}
+.ln[op="jmp" i][sz="short" i][a]:not([b]):not(:is([mb1],[mbd])) { --jfits: 1; }
+.ln[op="jmp" i][sz="near" i][a]:not([b]):not(:is([mb1],[mbd])) { --jfits: 0; }

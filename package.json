@@ -1,0 +1,26 @@
+{
+  "name": "accsembly",
+  "version": "0.2.0",
+  "description": "An x86-16 assembler implemented entirely in HTML and CSS, executed via Playwright. The CLI does not compute; the stylesheet does.",
+  "bin": {
+    "accsembly": "bin/accsembly.js"
+  },
+  "scripts": {
+    "test": "node test/test.js && node test/differential.js 60 && node test/bootstrap.js 10",
+    "test:diff": "node test/differential.js 400",
+    "test:boot": "node test/bootstrap.js 40",
+    "build:boot": "node bin/accsembly.js boot/lexer.asm -q -o boot/lexer.com && node bin/accsembly.js boot/linker.asm -q -o boot/linker.com && node bin/accsembly.js boot/writer.asm -q -o boot/writer.com"
+  },
+  "keywords": [
+    "assembler",
+    "css",
+    "x86",
+    "abomination",
+    "playwright"
+  ],
+  "license": "MIT",
+  "type": "commonjs",
+  "dependencies": {
+    "playwright": "^1.61.1"
+  }
+}
